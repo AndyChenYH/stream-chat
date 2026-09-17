@@ -34,6 +34,7 @@ function App() {
   async function refresh(access = key, offset = 0) {
     const rows = await (await api(`/v1/conversations?offset=${offset}`, {}, access)).json();
     setChats(old => offset ? [...old, ...rows] : rows); setMoreChats(rows.length === 50);
+    if (!offset) setChat(current => current ? rows.find(item => item.id === current.id) || current : current);
   }
   async function unlock(e) {
     e.preventDefault(); setError(''); setLoading(true);
