@@ -7,7 +7,8 @@ function WorkerState({workers}) {
   if (workers.throttled) return <>GPU capacity is throttled. Waiting for Runpod to allocate capacity.</>;
   if (workers.initializing) return <>Worker initializing. Runpod groups image/model downloads and startup under this state.</>;
   if (workers.running) return <>Worker running. Waiting for the readiness probe to confirm vLLM is healthy.</>;
-  if (workers.idle) return <>Worker idle / scaled down. Waiting for it to resume.</>;
+  if (workers.ready) return <>Runpod reports a ready worker. Waiting for the readiness probe to confirm vLLM is healthy.</>;
+  if (workers.idle) return <>Runpod reports an idle worker. Waiting for the model readiness check.</>;
   return <>No worker assigned yet. Waiting for scheduling and provisioning.</>;
 }
 
