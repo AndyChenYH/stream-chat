@@ -4,7 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 from backend.gate import Gate, QueueFull, ConversationBusy
 from backend.main import Job, create_app
-from shared import model_pb2 as pb
+from shared.events import Chunk
 
 
 class MemoryStore:
@@ -28,10 +28,11 @@ class FakeModel:
     async def close(self): pass
     async def ready(self): return {'ready':True, 'model':'test'}
     async def generate(self, *args):
-        yield pb.Chunk(text='Hello ')
+        yield Chunk(started=True)
+        yield Chunk(text='Hello ')
         await asyncio.sleep(.01)
-        yield pb.Chunk(text='world')
-        yield pb.Chunk(done=True, finish_reason='stop')
+        yield Chunk(text='world')
+        yield Chunk(done=True, finish_reason='stop')
 
 
 @pytest.mark.asyncio
@@ -59,7 +60,7 @@ async def test_done_only_after_answer_is_saved():
     async for frame in job.stream():
         events.append(frame)
         if 'event: done' in frame: assert store.saved == ['Hello world']
-    assert ['queued','started','token','token','done'] == [f.split('\n')[0][7:] for f in events]
+    assert ['queued','starting','started','token','token','done'] == [f.split('\n')[0][7:] for f in events]
     assert not gate.tickets
 
 
@@ -67,7 +68,7 @@ async def test_done_only_after_answer_is_saved():
 async def test_partial_stream_is_not_saved():
     class Broken(FakeModel):
         async def generate(self,*args):
-            yield pb.Chunk(text='partial')
+            yield Chunk(text='partial')
             raise RuntimeError('connection failed')
     store, gate = MemoryStore(), Gate()
     rid = uuid4(); await store.accept(store.chat_id,rid,'hello')
@@ -84,7 +85,7 @@ async def test_disconnect_releases_active_slot_and_cancels_worker():
     class Slow(FakeModel):
         async def generate(self,*args):
             try:
-                yield pb.Chunk(text='partial')
+                yield Chunk(text='partial')
                 await asyncio.Event().wait()
             finally: cancelled.set()
     store, gate = MemoryStore(), Gate()
@@ -130,3 +131,11 @@ def test_chunked_request_size_is_bounded():
     with TestClient(app) as client:
         result = client.post('/v1/conversations',content=iter([b'x'*20000,b'x'*20000]),headers={'Authorization':'Bearer '+'test-'*10})
         assert result.status_code == 413
+
+
+def test_fly_health_probe_does_not_wake_database():
+    class SleepingStore(MemoryStore):
+        async def healthy(self): raise AssertionError('Health probe woke Neon')
+    app=create_app(store=SleepingStore(),model=FakeModel(),access_key='test-'*10)
+    with TestClient(app) as client:
+        assert client.get('/healthz').status_code==200

@@ -1,35 +1,50 @@
 import asyncio
+import contextlib
 import json
 import os
-import signal
+import secrets
+from typing import Literal
+from uuid import UUID
 
-import grpc
 import httpx
-from shared import model_pb2 as pb, model_pb2_grpc as rpc
-from shared.tls import pem
+from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.responses import Response, StreamingResponse
+from pydantic import BaseModel, Field, model_validator
+from starlette.background import BackgroundTask
+from shared.events import sse
+from shared.limits import BodyLimit
 
 
-class Worker(rpc.ModelWorkerServicer):
+class Message(BaseModel):
+    role: Literal['user', 'assistant']
+    content: str = Field(min_length=1, max_length=65536)
+
+
+class Generate(BaseModel):
+    run_id: UUID
+    messages: list[Message] = Field(min_length=1, max_length=41)
+    max_tokens: int = Field(default=1024, ge=1, le=1024)
+
+    @model_validator(mode='after')
+    def last_message_is_user(self):
+        if self.messages[-1].role != 'user':
+            raise ValueError('Last message must be a user prompt')
+        return self
+
+
+class Worker:
     def __init__(self, client=None, model=None):
         self.model = model or os.environ.get('MODEL_NAME', 'Qwen/Qwen3-4B-Instruct-2507')
         self.client = client or httpx.AsyncClient(base_url='http://127.0.0.1:8000', timeout=httpx.Timeout(180, connect=5))
-        self.busy = False
+        self.ticket = None
 
-    async def authenticate(self, context):
-        identities = context.auth_context().get('x509_common_name', [])
-        if b'chat-service' not in identities:
-            await context.abort(grpc.StatusCode.UNAUTHENTICATED, 'Chat service certificate required')
-
-    async def Ready(self, request, context):
-        await self.authenticate(context)
+    async def ready(self):
         try:
-            response = await self.client.get('/health', timeout=5)
-            return pb.ReadyReply(ready=response.status_code == 200, model=self.model)
+            return (await self.client.get('/health', timeout=2)).status_code == 200
         except httpx.HTTPError:
-            return pb.ReadyReply(ready=False, model=self.model)
+            return False
 
     async def fit_context(self, messages, max_tokens):
-        """Count with the runtime's actual chat template; remove oldest full turns."""
         messages = [{'role': 'system', 'content': 'You are a helpful assistant. Answer clearly and accurately.'}] + messages
         while True:
             response = await self.client.post('/tokenize', json={
@@ -43,65 +58,83 @@ class Worker(rpc.ModelWorkerServicer):
             while len(messages) > 2 and messages[1]['role'] != 'user':
                 del messages[1]
 
-    async def Generate(self, request, context):
-        await self.authenticate(context)
-        if self.busy:
-            await context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, 'Worker already generating')
-        if (not request.messages or len(request.messages) > 41
-            or any(m.role not in ('user', 'assistant') or len(m.content) > 65536 for m in request.messages)
-            or request.messages[-1].role != 'user' or not 1 <= request.max_tokens <= 1024):
-            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, 'Invalid generation request')
-        self.busy = True
+    async def generate(self, request, ticket):
         try:
-            messages = await self.fit_context([{'role': m.role, 'content': m.content} for m in request.messages], request.max_tokens)
-            async with self.client.stream('POST', '/v1/chat/completions', json={
-                'model': self.model, 'messages': messages, 'stream': True,
-                'max_tokens': request.max_tokens, 'temperature': 0.7}) as response:
-                response.raise_for_status()
-                reason, ended = None, False
-                async for line in response.aiter_lines():
-                    if not line.startswith('data:'):
-                        continue
-                    data = line[5:].strip()
-                    if data == '[DONE]':
-                        ended = True
-                        break
-                    packet = json.loads(data)
-                    if packet.get('error'):
-                        raise RuntimeError('Model runtime error')
-                    for choice in packet.get('choices', []):
-                        if text := choice.get('delta', {}).get('content'):
-                            yield pb.Chunk(text=text)
-                        if choice.get('finish_reason'):
-                            reason = choice['finish_reason']
-                if not ended or not reason:
-                    raise RuntimeError('Incomplete model stream')
-                yield pb.Chunk(done=True, finish_reason=reason)
+            async with asyncio.timeout(180):
+                messages = await self.fit_context([m.model_dump() for m in request.messages], request.max_tokens)
+                async with self.client.stream('POST', '/v1/chat/completions', json={
+                    'model': self.model, 'messages': messages, 'stream': True,
+                    'max_tokens': request.max_tokens, 'temperature': 0.7}) as response:
+                    response.raise_for_status()
+                    reason, ended = None, False
+                    async for line in response.aiter_lines():
+                        if not line.startswith('data:'):
+                            continue
+                        data = line[5:].strip()
+                        if data == '[DONE]':
+                            ended = True
+                            break
+                        packet = json.loads(data)
+                        if packet.get('error'):
+                            raise RuntimeError('Model runtime error')
+                        for choice in packet.get('choices', []):
+                            if text := choice.get('delta', {}).get('content'):
+                                yield sse('token', {'text': text})
+                            if choice.get('finish_reason'):
+                                reason = choice['finish_reason']
+                    if not ended or reason not in ('stop', 'length'):
+                        raise RuntimeError('Incomplete model stream')
+                    yield sse('done', {'finish_reason': reason})
         except asyncio.CancelledError:
-            raise  # Closing the HTTP stream propagates cancellation to vLLM.
-        except ValueError:
-            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, 'Prompt or runtime response invalid')
+            raise  # Closing the runtime stream cancels inference.
         except Exception:
-            await context.abort(grpc.StatusCode.UNAVAILABLE, 'Model runtime unavailable or stream incomplete')
+            yield sse('error', {'message': 'Model unavailable or stream incomplete'})
         finally:
-            self.busy = False
+            await self.release(ticket)
+
+    async def release(self, ticket):
+        if self.ticket is ticket:
+            self.ticket = None
 
 
-async def serve():
-    worker = Worker()
-    server = grpc.aio.server(options=[('grpc.max_receive_message_length', 1048576)], maximum_concurrent_rpcs=8)
-    rpc.add_ModelWorkerServicer_to_server(worker, server)
-    credentials = grpc.ssl_server_credentials([(pem('TLS_SERVER_KEY'), pem('TLS_SERVER_CERT'))],
-        root_certificates=pem('TLS_CA'), require_client_auth=True)
-    server.add_secure_port('[::]:50051', credentials)
-    await server.start()
-    stop = asyncio.Event()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        asyncio.get_running_loop().add_signal_handler(sig, stop.set)
-    await stop.wait()
-    await server.stop(grace=10)
-    await worker.client.aclose()
+def create_app(worker=None, service_key=None):
+    key = service_key or os.environ['WORKER_SERVICE_KEY']
+    if len(key) < 32:
+        raise ValueError('WORKER_SERVICE_KEY must contain at least 32 random characters')
+    runtime = worker or Worker()
 
+    @contextlib.asynccontextmanager
+    async def lifespan(app):
+        yield
+        await runtime.client.aclose()
 
-if __name__ == '__main__':
-    asyncio.run(serve())
+    app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+    app.add_middleware(BodyLimit, limit=1048576)
+
+    async def auth(x_worker_key: str = Header(default='')):
+        if not secrets.compare_digest(x_worker_key.encode(), key.encode()):
+            raise HTTPException(401, 'Invalid service key')
+
+    @app.get('/ping')
+    async def ping():
+        # Runpod's internal health checker needs an unauthenticated 200/204.
+        return Response(status_code=200 if await runtime.ready() else 204)
+
+    @app.post('/generate', dependencies=[Depends(auth)])
+    async def generate(request: Generate):
+        if runtime.ticket is not None:
+            raise HTTPException(429, 'Worker already generating')
+        # Acquire before any await so two requests cannot claim the worker.
+        ticket = object()
+        runtime.ticket = ticket
+        try:
+            if not await runtime.ready():
+                raise HTTPException(503, 'Model is starting')
+        except BaseException:
+            await runtime.release(ticket)
+            raise
+        return StreamingResponse(runtime.generate(request, ticket), media_type='text/event-stream',
+            headers={'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no'},
+            background=BackgroundTask(runtime.release, ticket))
+
+    return app

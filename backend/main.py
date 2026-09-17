@@ -1,6 +1,5 @@
 import asyncio
 import contextlib
-import json
 import logging
 import os
 import secrets
@@ -17,7 +16,8 @@ from starlette.background import BackgroundTask
 from backend.gate import Gate, QueueFull, ConversationBusy
 from backend.model import Model
 from backend.store import Store
-from backend.limits import BodyLimit
+from shared.limits import BodyLimit
+from shared.events import sse
 
 log = logging.getLogger('stream-chat')
 
@@ -34,9 +34,6 @@ class Prompt(BaseModel):
         return value.strip()
 
 
-def sse(event, data):
-    return f'event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n'
-
 
 class Job:
     def __init__(self, store, model, gate, ticket, chat_id, run_id):
@@ -51,14 +48,16 @@ class Job:
     async def run(self):
         try:
             await self.emit('queued', {'run_id': str(self.run_id), 'position': self.gate.position(self.ticket)})
-            async with asyncio.timeout(240):
-                await asyncio.wait_for(self.ticket.ready.wait(), timeout=60)
+            async with asyncio.timeout(720):
+                await asyncio.wait_for(self.ticket.ready.wait(), timeout=300)
                 await self.store.healthy()
                 await self.store.status(self.run_id, 'streaming')
                 messages = await self.store.context(self.chat_id, self.run_id)
-                await self.emit('started', {})
+                await self.emit('starting', {})
                 parts, finished, reason = [], False, ''
                 async for chunk in self.model.generate(self.run_id, messages):
+                    if chunk.started:
+                        await self.emit('started', {})
                     if chunk.text:
                         parts.append(chunk.text)
                         await self.emit('token', {'text': chunk.text})
@@ -148,10 +147,7 @@ def create_app(store=None, model=None, access_key=None, origins=None):
 
     @app.get('/healthz')
     async def health():
-        try:
-            await app.state.store.healthy()
-        except Exception:
-            raise HTTPException(503, 'Database unavailable')
+        # Fly probes this frequently. Do not wake Neon or Runpod here.
         return {'ok': True}
 
     @app.get('/v1/status', dependencies=[Depends(auth)])

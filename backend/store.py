@@ -1,6 +1,5 @@
 from pathlib import Path
 from uuid import uuid4
-import asyncio
 
 import asyncpg
 
@@ -8,28 +7,20 @@ import asyncpg
 class Store:
     def __init__(self, url):
         self.url = url
-        self.lease_guard = asyncio.Lock()
 
     async def open(self):
-        # A dedicated direct connection prevents two API processes owning the queue.
-        self.lease = await asyncpg.connect(self.url, command_timeout=10)
-        if not await self.lease.fetchval('SELECT pg_try_advisory_lock(7218462026)'):
-            await self.lease.close()
-            raise RuntimeError('Another chat service is running. Deploy exactly one process.')
-        self.pool = await asyncpg.create_pool(self.url, min_size=1, max_size=4, command_timeout=15)
+        # Close idle connections so Neon can scale to zero between visits.
+        self.pool = await asyncpg.create_pool(self.url, min_size=0, max_size=4,
+            max_inactive_connection_lifetime=30, timeout=20, command_timeout=15)
         async with self.pool.acquire() as db, db.transaction():
             await db.execute(Path(__file__).with_name('schema.sql').read_text())
             await db.execute("UPDATE runs SET status='interrupted', finished_at=now() WHERE status IN ('queued','streaming')")
 
     async def close(self):
         await self.pool.close()
-        await self.lease.close()
 
     async def healthy(self):
-        if self.lease.is_closed():
-            raise RuntimeError('Queue lease lost; restart the service')
-        async with self.lease_guard:
-            await self.lease.execute('SELECT 1')
+        await self.pool.fetchval('SELECT 1')
 
     async def list_chats(self, offset=0):
         return [dict(r) for r in await self.pool.fetch(

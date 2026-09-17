@@ -20,8 +20,6 @@ async def test_postgres_transactions_deduplication_and_restart():
         await store.complete(chat['id'],rid,'answer')
         assert [m['content'] for m in await store.messages(chat['id'])]==['hello','answer']
         await store.accept(chat['id'],pending,'interrupted question')
-        second=Store(url)
-        with pytest.raises(RuntimeError,match='Another chat service'): await second.open()
     finally: await store.close()
     store=Store(url); await store.open()
     try:

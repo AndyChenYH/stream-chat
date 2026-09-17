@@ -72,6 +72,7 @@ function App() {
       setMessages(old => [...old, {id:requestId, role:'user', content:text}, {id:assistantId, role:'assistant', content:'', pending:true}]);
       await readEvents(response.body, (event, data) => {
         if (event === 'queued') setPhase(data.position ? `Queued · ${data.position} ahead` : 'Preparing');
+        if (event === 'starting') setPhase('Starting model… The first response may take a few minutes');
         if (event === 'started') setPhase('Generating');
         if (event === 'token') setMessages(old => old.map(m => m.id === assistantId ? {...m, content:m.content + data.text} : m));
         if (event === 'done') {
@@ -107,7 +108,7 @@ function App() {
     <nav aria-label="Conversations">{chats.map(c=><button key={c.id} className={chat?.id===c.id?'chat-link selected':'chat-link'} onClick={()=>openChat(c)} disabled={busy || loading}><span>◷</span><span>{c.title}</span></button>)}
       {!chats.length && <p className="empty-list">Your conversations will appear here.</p>}{moreChats && <button onClick={()=>refresh(key,chats.length).catch(e=>setError(e.message))}>Load more</button>}</nav>
     <div className="account"><div className="avatar">A</div><div><strong>Personal workspace</strong><small>Access key protected</small></div><button title="Lock workspace" aria-label="Lock workspace" disabled={busy} onClick={()=>{setKey('');newChat();setChats([])}}>↗</button></div>
-  </aside><main><header><button className="menu-toggle" aria-label="Toggle conversations" aria-expanded={menuOpen} onClick={()=>setMenuOpen(!menuOpen)}>☰</button><div><strong>{chat?.title || 'New conversation'}</strong><span>Private workspace</span></div><div className="status"><i className={model?.ready?'online':''}/>{model?.ready?'Model ready':'Model unavailable'}</div></header>
+  </aside><main><header><button className="menu-toggle" aria-label="Toggle conversations" aria-expanded={menuOpen} onClick={()=>setMenuOpen(!menuOpen)}>☰</button><div><strong>{chat?.title || 'New conversation'}</strong><span>Private workspace</span></div><div className="status"><i className={model?.ready?'online':''}/>{model?.mode==='on-demand'?'Starts on demand':model?.ready?'Model ready':'Model unavailable'}</div></header>
     <section className="conversation" aria-label="Messages">
       {moreMessages && <button disabled={loading} onClick={()=>openChat(chat,true)}>Load earlier messages</button>}
       {!messages.length && <div className="welcome"><span className="spark">✳</span><div className="eyebrow">SPACE FOR YOUR NEXT IDEA</div><h1>What’s on your mind?</h1><p>Ask a question, work through a problem,<br/>or start somewhere unexpected.</p>
