@@ -26,6 +26,8 @@ export default function Diagnostics({trace}) {
   return <section className={`diagnostics ${trace.finishedAt != null ? 'settled' : 'live'}`} aria-label="Request diagnostics">
     <div className="diagnostic-heading"><div className="diagnostic-kicker">REQUEST DIAGNOSTICS</div><span>{trace.finishedAt != null ? 'Finished' : 'Live'}</span></div>
     <div className="diagnostic-current" role="status"><strong>{trace.title}</strong><p>{trace.detail}</p></div>
+    <div className="diagnostic-summary"><span>Elapsed <b>{duration(Math.max(0, end - trace.startedAt))}</b></span><span>First token <b>{duration(trace.firstTokenAt == null ? null : trace.firstTokenAt - trace.startedAt)}</b></span><span>Chunks <b>{trace.chunks}</b></span></div>
+    <details className="diagnostic-details"><summary>Debug metrics and event timeline · {trace.events.length} entries</summary>
     <dl className="diagnostic-stats">
       <div><dt>Total elapsed</dt><dd>{duration(Math.max(0, end - trace.startedAt))}</dd></div>
       <div><dt>First token to browser</dt><dd>{duration(trace.firstTokenAt == null ? null : trace.firstTokenAt - trace.startedAt)}</dd></div>
@@ -41,5 +43,6 @@ export default function Diagnostics({trace}) {
     <details className="diagnostic-timeline" open><summary>Event timeline · {trace.events.length} entries</summary><ol>{trace.events.map((item, index) => <li key={index}><time>+{duration(item.at - trace.startedAt)}</time><div><strong>{item.title}</strong><p>{item.detail}</p><small>{item.source || 'Runpod'}{item.serverElapsed != null ? ` · server +${duration(item.serverElapsed)}` : ''}</small></div></li>)}</ol></details>
     <div className="diagnostic-id">Request <code>{trace.requestId}</code>{trace.model && <><br/>Model <code>{trace.model}</code></>}</div>
     <small className="diagnostic-footnote">Diagnostics stay in this tab for the latest request. Conversation text persists in Neon. Diagnostics do not keep the GPU awake after the request.</small>
+    </details>
   </section>;
 }
