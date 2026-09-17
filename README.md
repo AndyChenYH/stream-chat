@@ -2,6 +2,15 @@
 
 A personal React/Vite chat app on GitHub Pages, a Fly.io HTTPS/SSE API, Neon managed Postgres history, and a Runpod Serverless GPU worker that scales from zero to one. The API calls the worker over authenticated HTTPS streaming. The worker calls vLLM on localhost.
 
+## Deployment
+
+- Chat: https://andychenyh.github.io/stream-chat/
+- API: https://stream-chat-andy.fly.dev
+- Runpod endpoint: `3bjnfx7c4y7izs` (zero active workers, one maximum).
+- Database: Neon Free project `stream-chat`, Postgres 16 in AWS Oregon.
+
+Local source is in `~/Coding/stream-chat`. Deployment secrets are in the ignored, mode-0600 `.secrets/fly-serverless.env`; `CHAT_ACCESS_KEY` unlocks the personal workspace. Keep this file private.
+
 ## Request flow
 
 1. The browser sends a prompt and personal access key to Fly. Fly saves the prompt in Postgres and reserves a place in its bounded memory queue.
@@ -43,7 +52,7 @@ Build the **Build GPU worker image** GitHub Actions workflow and use its commit-
 | Active/minimum workers | 0 |
 | Maximum workers | 1 |
 | GPUs per worker | 1 |
-| Initial GPU tier | 16 GB |
+| GPU tiers | 16 GB preferred, 24 GB fallback |
 | Idle timeout | 60 seconds |
 | FlashBoot | Enabled |
 | Cached model | `Qwen/Qwen3-4B-Instruct-2507` |
@@ -71,6 +80,17 @@ Use `fly deploy --ha=false --strategy immediate`, and keep exactly one Machine. 
 ## GitHub Pages
 
 The repository variable `API_BASE_URL` is the Fly HTTPS origin. Set Pages source to **GitHub Actions** and use the included frontend deployment workflow. Vite uses relative assets for project Pages URLs. Never place credentials in `VITE_` variables.
+
+## Verified behavior
+
+The deployed path was tested on 2026-09-16 with Qwen3 4B on an RTX A5000:
+
+- Scale from zero running workers: 90.4 seconds to first token, 91.4 seconds to finish a short answer.
+- Warm follow-up: 0.73 seconds to first token, 1.1 seconds total.
+- Completed replies survived browser reload; queued and active generation cancellation preserved the prompt without saving a partial assistant reply.
+- Unauthenticated Fly requests and Runpod requests missing the separate worker service key returned 401.
+
+These are individual measurements, not latency guarantees. The first host had to download and extract the container image before loading the model; that initial setup took several additional minutes. Runpod reported $0.00019/second for the A5000 worker, including running idle time. At that rate, a 90-second billed startup/generation plus a 60-second idle tail would cost about $0.029; provider scheduling delays can be unbilled. The preferred 16 GB tier starts at $0.00016/second. Check Runpod billing for actual charges.
 
 ## Acceptance and operations
 
