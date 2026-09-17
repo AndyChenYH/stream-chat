@@ -73,7 +73,8 @@ async def test_disconnect_closes_runtime_and_releases_only_its_ticket():
     async with httpx.AsyncClient(transport=httpx.MockTransport(runtime),base_url='http://localhost') as client:
         worker=Worker(client=client); old=worker.ticket=object()
         stream=worker.generate(Generate(**payload()),old)
-        assert 'partial' in await anext(stream)
+        while 'event: token' not in (frame := await anext(stream)): pass
+        assert 'partial' in frame
         await stream.aclose()
         assert closed.is_set() and worker.ticket is None
         newer=worker.ticket=object()
@@ -88,3 +89,24 @@ def test_model_cache_resolves_snapshot_and_requires_cache(tmp_path):
     assert resolve('Qwen/model',tmp_path)==str(cache/'snapshots'/'abc')
     with pytest.raises(RuntimeError,match='cached model'):
         resolve('missing/model',tmp_path)
+
+
+def test_worker_reports_real_context_stages_and_final_token_usage():
+    def runtime(request):
+        if request.url.path in ('/tokenize', '/health'):
+            return runtime_reply(request)
+        assert json.loads(request.content)['stream_options'] == {'include_usage': True}
+        return httpx.Response(200, text=(
+            'data: {"choices":[{"delta":{"content":"hello"},"finish_reason":"stop"}]}\n\n'
+            'data: {"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":1,"total_tokens":21}}\n\n'
+            'data: [DONE]\n\n'))
+    runtime_client = httpx.AsyncClient(transport=httpx.MockTransport(runtime),base_url='http://localhost')
+    with TestClient(create_app(worker=Worker(client=runtime_client),service_key=KEY)) as client:
+        result = client.post('/generate',json=payload(),headers={'X-Worker-Key':KEY})
+    frames = [frame.splitlines() for frame in result.text.strip().split('\n\n')]
+    events = [(lines[0][7:], json.loads(lines[1][6:])) for lines in frames]
+    assert [data['stage'] for event,data in events if event == 'status'] == [
+        'tokenizing','context_ready','runtime_request','runtime_stream_open']
+    assert events[1][1]['prompt_tokens'] == 20
+    assert events[-2] == ('usage', {'prompt_tokens':20,'completion_tokens':1,'total_tokens':21})
+    assert events[-1][0] == 'done'

@@ -3,6 +3,9 @@ import contextlib
 import logging
 import os
 import secrets
+import time
+
+import httpx
 from uuid import UUID
 
 import anyio
@@ -41,32 +44,58 @@ class Job:
         self.chat_id, self.run_id = chat_id, run_id
         self.events = asyncio.Queue(maxsize=64)
         self.task = None
+        self.started_at = time.monotonic()
+        self.phase = 'prompt_saved'
+        self.chunks = self.characters = 0
+        self.first_token_ms = None
+
+    def elapsed_ms(self):
+        return round((time.monotonic() - self.started_at) * 1000)
 
     async def emit(self, event, data):
-        await asyncio.wait_for(self.events.put((event, data)), timeout=15)
+        await asyncio.wait_for(self.events.put((event, {**data, 'elapsed_ms': self.elapsed_ms()})), timeout=15)
+
+    async def progress(self, stage, **details):
+        if stage not in ('worker_snapshot', 'telemetry_unavailable', 'token_usage'):
+            self.phase = stage
+        await self.emit('status', {'stage': stage, **details})
 
     async def run(self):
         try:
+            await self.progress('prompt_saved')
+            self.phase = 'queued'
             await self.emit('queued', {'run_id': str(self.run_id), 'position': self.gate.position(self.ticket)})
             async with asyncio.timeout(720):
                 await asyncio.wait_for(self.ticket.ready.wait(), timeout=300)
+                await self.progress('loading_history')
                 await self.store.healthy()
                 await self.store.status(self.run_id, 'streaming')
                 messages = await self.store.context(self.chat_id, self.run_id)
+                await self.progress('history_loaded', context_messages=len(messages))
+                self.phase = 'worker_startup'
                 await self.emit('starting', {})
-                parts, finished, reason = [], False, ''
-                async for chunk in self.model.generate(self.run_id, messages):
+                parts, finished, reason, usage = [], False, '', None
+                async for chunk in self.model.generate(self.run_id, messages, self.progress):
                     if chunk.started:
                         await self.emit('started', {})
                     if chunk.text:
+                        if self.first_token_ms is None:
+                            self.first_token_ms = self.elapsed_ms()
+                            await self.progress('first_token')
+                        self.phase = 'streaming'
+                        self.chunks += 1
+                        self.characters += len(chunk.text)
                         parts.append(chunk.text)
-                        await self.emit('token', {'text': chunk.text})
+                        await self.emit('token', {'text': chunk.text, 'chunks': self.chunks, 'characters': self.characters})
                     if chunk.done:
-                        finished, reason = True, chunk.finish_reason
+                        finished, reason, usage = True, chunk.finish_reason, chunk.usage
                 if not finished:
                     raise RuntimeError('Worker stream ended without completion')
+                await self.progress('saving_reply', chunks=self.chunks, characters=self.characters)
                 message_id = await self.store.complete(self.chat_id, self.run_id, ''.join(parts))
-                await self.emit('done', {'message_id': message_id, 'finish_reason': reason})
+                await self.emit('done', {'message_id': message_id, 'finish_reason': reason,
+                    'chunks': self.chunks, 'characters': self.characters,
+                    'first_token_ms': self.first_token_ms, 'usage': usage})
         except asyncio.CancelledError:
             await self.store.status(self.run_id, 'cancelled')
             raise
@@ -76,7 +105,9 @@ class Job:
             with contextlib.suppress(Exception):
                 await self.store.status(self.run_id, 'failed')
             with contextlib.suppress(asyncio.TimeoutError):
-                await self.emit('error', {'message': 'Generation failed or timed out. Your prompt is saved; reload history before retrying.'})
+                await self.emit('error', {'message': 'Generation failed or timed out. Your prompt is saved; reload history before retrying.',
+                    'stage': self.phase, 'error_type': type(exc).__name__,
+                    'http_status': exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None})
         finally:
             self.gate.release(self.ticket)
 
@@ -99,7 +130,9 @@ class Job:
                     if self.task.done():
                         yield sse('error', {'message': 'Stream interrupted. Reload conversation history.'})
                         return
-                    yield ': keepalive\n\n'
+                    yield sse('heartbeat', {'stage': self.phase, 'elapsed_ms': self.elapsed_ms(),
+                        'position': self.gate.position(self.ticket), 'chunks': self.chunks,
+                        'characters': self.characters})
                     continue
                 yield sse(event, data)
                 if event in ('done', 'error'):

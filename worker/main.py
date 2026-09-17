@@ -44,14 +44,14 @@ class Worker:
         except httpx.HTTPError:
             return False
 
-    async def fit_context(self, messages, max_tokens):
+    async def fit_context(self, messages, max_tokens, with_tokens=False):
         messages = [{'role': 'system', 'content': 'You are a helpful assistant. Answer clearly and accurately.'}] + messages
         while True:
             response = await self.client.post('/tokenize', json={
                 'model': self.model, 'messages': messages, 'add_generation_prompt': True})
             response.raise_for_status()
             if response.json()['count'] + max_tokens <= int(os.environ.get('MAX_MODEL_LEN', '8192')):
-                return messages
+                return (messages, response.json()['count']) if with_tokens else messages
             if len(messages) <= 2:
                 raise ValueError('Prompt exceeds model context window')
             del messages[1]
@@ -61,11 +61,18 @@ class Worker:
     async def generate(self, request, ticket):
         try:
             async with asyncio.timeout(180):
-                messages = await self.fit_context([m.model_dump() for m in request.messages], request.max_tokens)
+                yield sse('status', {'stage': 'tokenizing', 'context_messages': len(request.messages)})
+                messages, prompt_tokens = await self.fit_context(
+                    [m.model_dump() for m in request.messages], request.max_tokens, with_tokens=True)
+                yield sse('status', {'stage': 'context_ready', 'prompt_tokens': prompt_tokens,
+                    'context_messages': len(messages), 'trimmed_messages': len(request.messages) + 1 - len(messages)})
+                yield sse('status', {'stage': 'runtime_request'})
                 async with self.client.stream('POST', '/v1/chat/completions', json={
                     'model': self.model, 'messages': messages, 'stream': True,
+                    'stream_options': {'include_usage': True},
                     'max_tokens': request.max_tokens, 'temperature': 0.7}) as response:
                     response.raise_for_status()
+                    yield sse('status', {'stage': 'runtime_stream_open', 'http_status': response.status_code})
                     reason, ended = None, False
                     async for line in response.aiter_lines():
                         if not line.startswith('data:'):
@@ -77,6 +84,9 @@ class Worker:
                         packet = json.loads(data)
                         if packet.get('error'):
                             raise RuntimeError('Model runtime error')
+                        if packet.get('usage'):
+                            yield sse('usage', {k: v for k, v in packet['usage'].items()
+                                if k in ('prompt_tokens', 'completion_tokens', 'total_tokens') and type(v) is int})
                         for choice in packet.get('choices', []):
                             if text := choice.get('delta', {}).get('content'):
                                 yield sse('token', {'text': text})

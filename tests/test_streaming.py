@@ -1,4 +1,5 @@
 import asyncio
+import json
 from uuid import uuid4
 import pytest
 from fastapi.testclient import TestClient
@@ -60,7 +61,12 @@ async def test_done_only_after_answer_is_saved():
     async for frame in job.stream():
         events.append(frame)
         if 'event: done' in frame: assert store.saved == ['Hello world']
-    assert ['queued','starting','started','token','token','done'] == [f.split('\n')[0][7:] for f in events]
+    decoded = [(f.split('\n')[0][7:], json.loads(f.split('\n')[1][6:])) for f in events]
+    assert ['queued','starting','started','token','token','done'] == [event for event, _ in decoded if event != 'status']
+    stages = [data['stage'] for event, data in decoded if event == 'status']
+    assert stages == ['prompt_saved','loading_history','history_loaded','first_token','saving_reply']
+    assert decoded[-1][1]['chunks'] == 2 and decoded[-1][1]['characters'] == 11
+    assert decoded[-1][1]['first_token_ms'] <= decoded[-1][1]['elapsed_ms']
     assert not gate.tickets
 
 

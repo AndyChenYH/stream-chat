@@ -2,6 +2,8 @@ import React, {useEffect, useRef, useState} from 'react';
 import {createRoot} from 'react-dom/client';
 import {readEvents} from './sse';
 import './style.css';
+import Diagnostics from './RequestDiagnostics.jsx';
+import {createTrace, recordTrace} from './diagnostics';
 
 const API = (import.meta.env.VITE_API_URL || (import.meta.env.DEV ? 'http://127.0.0.1:8080' : '')).replace(/\/$/, '');
 
@@ -17,6 +19,7 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [phase, setPhase] = useState('');
+  const [trace, setTrace] = useState(null);
   const [model, setModel] = useState(null);
   const [moreChats, setMoreChats] = useState(false);
   const [moreMessages, setMoreMessages] = useState(false);
@@ -45,6 +48,7 @@ function App() {
   }
   async function openChat(item, older = false) {
     if (busy) return;
+    if (item.id !== chat?.id) setTrace(null);
     setLoading(true); setError(''); selected.current = item.id;
     try {
       const before = older && messages.length ? `?before=${messages[0].seq}` : '';
@@ -53,24 +57,30 @@ function App() {
       setMenuOpen(false); setChat(item); setMessages(old => older ? [...rows, ...old] : rows); setMoreMessages(rows.length === 100);
     } catch(e) { setError(e.message); } finally { if (selected.current === item.id) setLoading(false); }
   }
-  function newChat() { setMenuOpen(false); selected.current = null; setChat(null); setMessages([]); setMoreMessages(false); setPrompt(''); setError(''); }
+  function newChat() { setTrace(null); setPhase(''); setMenuOpen(false); selected.current = null; setChat(null); setMessages([]); setMoreMessages(false); setPrompt(''); setError(''); }
   async function send(e) {
     e.preventDefault(); if (busy || !prompt.trim()) return;
     setBusy(true); setError(''); setPhase('Connecting');
     const text = prompt.trim(), requestId = crypto.randomUUID();
     const assistantId = crypto.randomUUID(); let accepted = false;
+    setTrace(createTrace(requestId));
+    const observe = (event, data = {}) => setTrace(current => recordTrace(current, event, data));
     abort.current = new AbortController();
     try {
       let current = chat;
       if (!current) {
+        observe('browser', {stage:'creating_conversation'});
         current = await (await api('/v1/conversations', {method:'POST', signal: abort.current.signal})).json();
         setChat(current); selected.current = current.id;
       }
+      observe('browser', {stage:'submitting_prompt'});
       const response = await api(`/v1/conversations/${current.id}/messages`, {
         method:'POST', body:JSON.stringify({request_id:requestId, content:text}), signal:abort.current.signal});
       accepted = true; setPrompt('');
+      observe('browser', {stage:'stream_connected'});
       setMessages(old => [...old, {id:requestId, role:'user', content:text}, {id:assistantId, role:'assistant', content:'', pending:true}]);
       await readEvents(response.body, (event, data) => {
+        observe(event, data);
         if (event === 'queued') setPhase(data.position ? `Queued · ${data.position} ahead` : 'Preparing');
         if (event === 'starting') setPhase('Starting model… The first response may take a few minutes');
         if (event === 'started') setPhase('Generating');
@@ -82,6 +92,7 @@ function App() {
         if (event === 'error') throw new Error(data.message);
       });
     } catch(e) {
+      observe('browser', {stage:e.name === 'AbortError' ? 'cancelled' : 'error', message:e.message});
       setError(e.name === 'AbortError' ? 'Generation stopped. Partial text is not saved; reload history to check the final state.' : e.message);
       if (accepted) setMessages(old => old.map(m => m.id === assistantId ? {...m, pending:false, incomplete:true} : m));
       setPhase('');
@@ -113,10 +124,10 @@ function App() {
       {moreMessages && <button disabled={loading} onClick={()=>openChat(chat,true)}>Load earlier messages</button>}
       {!messages.length && <div className="welcome"><span className="spark">✳</span><div className="eyebrow">SPACE FOR YOUR NEXT IDEA</div><h1>What’s on your mind?</h1><p>Ask a question, work through a problem,<br/>or start somewhere unexpected.</p>
         <div className="suggestions">{['Explain a tricky concept','Help me think through an idea','Give me a writing prompt'].map(t=><button key={t} onClick={()=>setPrompt(t)}>{t}<span>↗</span></button>)}</div></div>}
-      {messages.map(m=><article key={m.id} className={`message ${m.role}`}><div className="message-label">{m.role==='user'?'YOU':'STREAM'}{m.incomplete || (m.run_status && m.run_status!=='done') ? <span> · {m.run_status || 'incomplete'}</span> : null}</div><div className="message-text">{m.content || (m.pending?'Thinking…':'')}{m.pending && m.content && <span className="cursor"/>}</div></article>)}<div ref={bottom}/>
+      {messages.map(m=><article key={m.id} className={`message ${m.role}`}><div className="message-label">{m.role==='user'?'YOU':'STREAM'}{m.incomplete || (m.run_status && m.run_status!=='done') ? <span> · {m.run_status || 'incomplete'}</span> : null}</div><div className="message-text">{m.content || (m.pending?(trace?.title || 'Waiting for server status…'):'')}{m.pending && m.content && <span className="cursor"/>}</div></article>)}{trace && <Diagnostics trace={trace}/>}<div ref={bottom}/>
     </section><div className="composer-area">{error && <div className="error" role="alert">{error}{chat && !busy && <button onClick={()=>openChat(chat)}>Reload history</button>}</div>}
       <form className="composer" onSubmit={send}><textarea aria-label="Message" placeholder="Message Stream…" maxLength={4096} value={prompt} disabled={busy || loading} onChange={e=>setPrompt(e.target.value)} onKeyDown={e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.nativeEvent.isComposing){e.preventDefault();send(e)}}}/>
-        <div className="composer-bottom"><span>{busy?phase:loading?'Loading…':phase || 'Shift + Enter for a new line'}</span>{busy?<button type="button" className="send" onClick={()=>abort.current?.abort()} aria-label="Stop generation">■</button>:<button className="send" disabled={!prompt.trim()||loading} aria-label="Send message">↑</button>}</div></form><p className="disclaimer">Answers can be imperfect. Check the details that matter.</p>
+        <div className="composer-bottom"><span>{busy?(trace?.title || phase):loading?'Loading…':phase || 'Shift + Enter for a new line'}</span>{busy?<button type="button" className="send" onClick={()=>abort.current?.abort()} aria-label="Stop generation">■</button>:<button className="send" disabled={!prompt.trim()||loading} aria-label="Send message">↑</button>}</div></form><p className="disclaimer">Answers can be imperfect. Check the details that matter.</p>
     </div></main></div>;
 }
 createRoot(document.getElementById('root')).render(<App/>);

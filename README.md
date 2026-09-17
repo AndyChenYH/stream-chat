@@ -81,6 +81,14 @@ Use `fly deploy --ha=false --strategy immediate`, and keep exactly one Machine. 
 
 The repository variable `API_BASE_URL` is the Fly HTTPS origin. Set Pages source to **GitHub Actions** and use the included frontend deployment workflow. Vite uses relative assets for project Pages URLs. Never place credentials in `VITE_` variables.
 
+## Live request diagnostics
+
+Each request shows a live status panel with a timestamped event timeline, request ID, elapsed time, time to first token in the browser, readiness attempts and HTTP results, heartbeat freshness, stream chunk/character counters, and chunk throughput. Startup snapshots report Runpod's actual worker counts every five seconds while a readiness probe is pending. Those control-plane reads do not wake another GPU. Provider failures only disable telemetry, not inference.
+
+Worker events distinguish tokenization/context trimming, vLLM submission, the local runtime stream opening, first output, streaming, and the final Neon commit. vLLM reports exact input/output token usage at completion; live chunk counts are explicitly not token counts. Runpod does not separately expose image download, model download, and runtime load percentages through this API, so the UI leaves those stages uncertain. Failures include the last known stage, exception type, and upstream HTTP code without exposing credentials or raw provider response bodies.
+
+Diagnostics remain in browser memory for the latest request and reset on navigation/reload. Conversation text and run status remain durable in Postgres. A local Stop is labelled as a cancellation request until history confirms the durable state.
+
 ## Verified behavior
 
 The deployed path was tested on 2026-09-16 with Qwen3 4B on an RTX A5000:

@@ -8,6 +8,7 @@ class Chunk:
     done: bool = False
     finish_reason: str = ''
     started: bool = False
+    usage: dict | None = None
 
 
 def sse(event, data):

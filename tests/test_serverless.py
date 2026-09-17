@@ -74,3 +74,41 @@ async def test_cold_start_wait_has_deadline_and_is_cancellable():
 def test_worker_credentials_never_go_to_plain_http_or_arbitrary_host():
     for endpoint in ('http://example.api.runpod.ai','https://example.com','https://example.api.runpod.ai.evil.test'):
         with pytest.raises(ValueError): Model(endpoint=endpoint,api_key='test',service_key='service-'*6)
+
+
+@pytest.mark.asyncio
+async def test_pending_readiness_emits_provider_state_and_cancellation_closes_probe():
+    cancelled=asyncio.Event()
+    async def probe(request):
+        try: await asyncio.Event().wait()
+        finally: cancelled.set()
+    def health(request):
+        return httpx.Response(200,json={'workers':{'running':1,'initializing':0,'idle':0,'ready':0},
+                                       'secret':'must-not-be-forwarded'})
+    reports=[]
+    observed=asyncio.Event()
+    async def report(stage, **details):
+        reports.append((stage,details))
+        if stage == 'worker_snapshot': observed.set()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(probe),base_url='https://example.api.runpod.ai') as client, httpx.AsyncClient(transport=httpx.MockTransport(health),base_url='https://api.runpod.ai/v2/example/') as status_client:
+        worker=model(client,status_client=status_client,poll_interval=.01)
+        task=asyncio.create_task(worker.wait_until_ready(report))
+        await asyncio.wait_for(observed.wait(),1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError): await task
+        assert cancelled.is_set()
+    assert reports[0][0] == 'readiness_probe'
+    assert any(stage == 'readiness_wait' for stage,_ in reports)
+    assert all('must-not-be-forwarded' not in str(details) for _,details in reports)
+
+
+@pytest.mark.asyncio
+async def test_failed_telemetry_does_not_prevent_model_readiness():
+    async def probe(request):
+        await asyncio.sleep(.03)
+        return httpx.Response(200)
+    reports=[]
+    async def report(stage, **details): reports.append(stage)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(probe),base_url='https://example.api.runpod.ai') as client, httpx.AsyncClient(transport=httpx.MockTransport(lambda r:httpx.Response(403)),base_url='https://api.runpod.ai/v2/example/') as status_client:
+        await model(client,status_client=status_client,poll_interval=.01).wait_until_ready(report)
+    assert 'telemetry_unavailable' in reports and reports[-1] == 'model_ready'
