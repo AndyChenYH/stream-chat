@@ -112,3 +112,22 @@ async def test_failed_telemetry_does_not_prevent_model_readiness():
     async with httpx.AsyncClient(transport=httpx.MockTransport(probe),base_url='https://example.api.runpod.ai') as client, httpx.AsyncClient(transport=httpx.MockTransport(lambda r:httpx.Response(403)),base_url='https://api.runpod.ai/v2/example/') as status_client:
         await model(client,status_client=status_client,poll_interval=.01).wait_until_ready(report)
     assert 'telemetry_unavailable' in reports and reports[-1] == 'model_ready'
+
+
+@pytest.mark.asyncio
+async def test_worker_diagnostics_and_usage_are_forwarded_without_raw_fields():
+    reports=[]
+    async def report(stage, **details): reports.append((stage,details))
+    def handler(request):
+        if request.method == 'GET': return httpx.Response(200)
+        return httpx.Response(200,headers={'content-type':'text/event-stream'},text=(
+            'event: status\ndata: {"stage":"tokenizing","context_messages":3,"secret":"hidden"}\n\n'
+            'event: status\ndata: {"stage":"unknown-stage","secret":"hidden"}\n\n'
+            'event: token\ndata: {"text":"hello"}\n\n'
+            'event: usage\ndata: {"prompt_tokens":20,"completion_tokens":1,"total_tokens":21,"secret":"hidden"}\n\n'
+            'event: done\ndata: {"finish_reason":"stop"}\n\n'))
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler),base_url='https://example.api.runpod.ai') as client:
+        result=[c async for c in model(client).generate(uuid4(),[],report)]
+    assert ('tokenizing', {'context_messages':3}) in reports
+    assert result[-1].usage == {'prompt_tokens':20,'completion_tokens':1,'total_tokens':21}
+    assert all('hidden' not in str(item) and item[0] != 'unknown-stage' for item in reports)
