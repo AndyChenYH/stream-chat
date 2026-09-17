@@ -1,17 +1,23 @@
 from pathlib import Path
 from uuid import uuid4
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+import ssl
 
 import asyncpg
 
 
 class Store:
     def __init__(self, url):
-        self.url = url
+        parts = urlsplit(url)
+        # asyncpg does not accept libpq's channel_binding URL parameter.
+        query = urlencode([(k,v) for k,v in parse_qsl(parts.query) if k != 'channel_binding'])
+        self.url = urlunsplit(parts._replace(query=query))
+        self.ssl = False if parts.hostname in ('localhost', '127.0.0.1', '::1') else ssl.create_default_context()
 
     async def open(self):
         # Close idle connections so Neon can scale to zero between visits.
         self.pool = await asyncpg.create_pool(self.url, min_size=0, max_size=4,
-            max_inactive_connection_lifetime=30, timeout=20, command_timeout=15)
+            max_inactive_connection_lifetime=30, timeout=20, command_timeout=15, ssl=self.ssl)
         async with self.pool.acquire() as db, db.transaction():
             await db.execute(Path(__file__).with_name('schema.sql').read_text())
             await db.execute("UPDATE runs SET status='interrupted', finished_at=now() WHERE status IN ('queued','streaming')")
