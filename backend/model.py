@@ -4,6 +4,7 @@ import os
 import re
 import httpx
 from shared.events import Chunk, read_events
+from shared.tools import validate_call
 
 
 async def ignore_status(stage, **details):
@@ -92,7 +93,7 @@ class Model:
                 await report('retry_delay', retry_in_s=self.retry_delay, attempt=attempt)
                 await asyncio.sleep(self.retry_delay)
 
-    async def generate(self, run_id, messages, report=None):
+    async def generate(self, run_id, messages, report=None, enable_tools=False):
         report = report or ignore_status
         await self.wait_until_ready(report)
         yield Chunk(started=True)
@@ -100,12 +101,13 @@ class Model:
         # Replaying an ambiguous generation POST can bill twice or change the answer.
         async with asyncio.timeout(180):
             async with self.client.stream('POST', '/generate', json={
-                'run_id': str(run_id), 'messages': messages, 'max_tokens': 1024}) as response:
+                'run_id': str(run_id), 'messages': messages, 'max_tokens': 1024,
+                'enable_tools': enable_tools}) as response:
                 response.raise_for_status()
                 if not response.headers.get('content-type', '').startswith('text/event-stream'):
                     raise RuntimeError('Expected a streaming worker response')
                 await report('worker_stream_open', http_status=response.status_code)
-                finished, size, usage = False, 0, None
+                finished, size, usage, calls = False, 0, None, []
                 async for event, data in read_events(response):
                     if finished:
                         raise RuntimeError('Worker sent data after completion')
@@ -131,11 +133,21 @@ class Model:
                         if size > 262144:
                             raise RuntimeError('Worker output limit exceeded')
                         yield Chunk(text=text)
+                    elif event == 'tool_call':
+                        if not enable_tools or len(calls) >= 6:
+                            raise RuntimeError('Unexpected tool call')
+                        validate_call(data)
+                        if any(c['id'] == data['id'] for c in calls):
+                            raise RuntimeError('Duplicate tool call')
+                        calls.append(data)
                     elif event == 'done':
                         reason = data['finish_reason']
-                        if reason not in ('stop', 'length'):
+                        if reason not in ('stop', 'length', 'tool_calls') or (reason == 'tool_calls') != bool(calls):
                             raise RuntimeError('Invalid finish reason')
                         finished = True
-                        yield Chunk(done=True, finish_reason=reason, usage=usage)
                 if not finished:
                     raise RuntimeError('Worker stream ended without completion')
+                # Wait for a clean HTTP EOF before exposing executable calls.
+                for call in calls:
+                    yield Chunk(tool_call=call)
+                yield Chunk(done=True, finish_reason=reason, usage=usage)

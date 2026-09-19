@@ -15,7 +15,7 @@ Local source is in `~/Coding/stream-chat`. Deployment secrets are in the ignored
 
 1. The browser sends a prompt and personal access key to Fly. Fly saves the prompt in Postgres and reserves a place in its bounded memory queue.
 2. Once its turn starts, Fly emits `starting` and makes authenticated readiness requests to Runpod. Runpod starts a GPU worker if none is running. Login and health probes never start a worker.
-3. The worker resolves Runpod's cached model, loads vLLM, and reports ready. Fly submits one generation request and forwards token chunks immediately over SSE.
+3. The worker resolves Runpod's cached model, loads vLLM, and reports ready. Fly submits a generation request and forwards token chunks immediately over SSE. With Code tools enabled, completed native tool calls return to Fly, which executes them in E2B and sends the results back to the model for another round.
 4. The completed reply is committed to Postgres before Fly sends `done`. Failed or cancelled partial responses are not saved as completed assistant replies.
 5. Runpod stops the worker after 60 idle seconds. Conversation history remains in Neon, which can also sleep when idle.
 
@@ -27,7 +27,19 @@ Fly verifies Runpod's HTTPS certificate and authenticates with a Runpod API key.
 
 Deploy exactly **one Fly Machine with one Uvicorn process**, **one maximum Runpod worker**, and vLLM `max-num-seqs=1`. Fly permits one active generation and five queued requests, with no Redis or external scheduler. The worker rejects overlapping generations. This is not a multi-user authentication system.
 
-Readiness GETs retry for at most 240 seconds; authentication failures stop immediately. Generation POSTs are never automatically replayed. Generation is limited to 180 seconds and 1024 output tokens. Queue waiting is capped at 300 seconds. A 10-second SSE heartbeat keeps the browser connection active during startup. Stop cancels the request; cancellation of startup leaves any already-starting worker to Runpod's idle timeout. A 60-second idle timeout and max-workers=1 are not a hard monthly spending cap.
+Readiness GETs retry for at most 240 seconds; authentication failures stop immediately. Generation POSTs are never automatically replayed. Each model round is limited to 180 seconds and 1024 output tokens, with a 720-second deadline for the entire request including queueing. Queue waiting is capped at 300 seconds. A 10-second SSE heartbeat keeps the browser connection active during startup. Stop cancels the request; cancellation of startup leaves any already-starting worker to Runpod's idle timeout. A 60-second idle timeout and max-workers=1 are not a hard monthly spending cap.
+
+## E2B code tools
+
+The composer has a **Code tools** checkbox and **Add file** control. With tools enabled, Qwen can call `terminal(command)`, `python(code)`, and `publish_file(path)`. The worker uses vLLM's native Hermes tool parser; text/code fences are never interpreted as commands. Fly waits for a complete, validated response before executing a tool. Tools run sequentially, with at most six calls plus a final model round. Turning tools off uses the original chat path.
+
+Fly creates one E2B code-interpreter sandbox on the first tool call, after GPU startup. No sandbox starts for a text-only answer. Commands and Python cells have a 30-second limit; the sandbox has a fixed 180-second provider timeout with kill-on-timeout and no auto-resume. It is killed as soon as the model finishes, or on Stop, disconnect, execution failure, or backend shutdown. Cancellation during creation waits briefly for the sandbox ID so it can still be killed. A failed cleanup is shown in diagnostics; the provider timeout remains the fallback. Sandbox memory/files persist between tools in one request, never between requests.
+
+The sandbox has no outbound internet and receives no Fly, Neon, Runpod, or E2B API credentials. E2B's API key is a Fly secret (`E2B_API_KEY`). The model receives uploaded file paths, and Fly stages conversation files into `/home/user/files/` only when a tool actually runs. Python includes common analysis packages. Use `plt.show()` for PNG plots and `publish_file` to preserve other files. Executable code stays in E2B; the backend never executes generated commands locally.
+
+Inputs, saved output files, and tool commands/results persist in Neon and are accessible from another client using the same personal key. Raw sandbox files disappear on termination. Files are limited to 2 MB each, 20 per conversation and 100 MB total; each task can publish up to six outputs. Downloads require the access key and use attachment responses; only validated PNGs are displayed inline. Tool history shows the latest 100 steps for a conversation. Request timing diagnostics still live only in the current tab.
+
+Before creating a sandbox, Fly reserves its full 180-second lifetime in Postgres. Confirmed termination refunds unused time; ambiguous creation/cleanup retains the full reservation. The app blocks creation beyond 3,600 reserved seconds in a rolling 24 hours or 36,000 seconds total. These limits survive restarts and apply across clients. At the default 2-vCPU/4-GiB E2B rate of $0.000046/second on 2026-09-19, ten hours is about $1.66 of credits. This is an application time allowance, not a provider-enforced dollar cap, and excludes Runpod and Fly charges. No card, credit purchase or paid upgrade is configured by this feature. Increasing the fixed allowance requires an intentional backend change.
 
 ## Repository
 

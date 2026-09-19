@@ -3,3 +3,5 @@ uvicorn==0.53.0
 asyncpg==0.31.0
 httpx==0.28.1
 anyio==4.15.1
+e2b-code-interpreter==2.10.0
+e2b==2.51.0

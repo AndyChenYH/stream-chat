@@ -28,3 +28,5 @@ uvicorn==0.53.0
 uvloop==0.22.1
 watchfiles==1.2.0
 websockets==17.1
+e2b-code-interpreter==2.10.0
+e2b==2.51.0
