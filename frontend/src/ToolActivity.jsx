@@ -1,5 +1,25 @@
 import React, {useEffect, useState} from 'react';
 
+function readableResult(raw) {
+  try {
+    const result=JSON.parse(raw);
+    if ('stdout' in result || 'stderr' in result || 'error' in result) {
+      return [result.exit_code != null ? `Exit code: ${result.exit_code}` : '', result.stdout,
+        result.stderr && `stderr:\n${result.stderr}`, ...(result.results || []),
+        result.error && `Error: ${result.error}`, result.message].filter(Boolean).join('\n') || '(No output)';
+    }
+    return JSON.stringify(result,null,2);
+  } catch { return raw; }
+}
+
+function executionStatus(step) {
+  if (step.status !== 'done' || !step.result) return step.status;
+  try {
+    const result=JSON.parse(step.result);
+    return result.error || (result.exit_code != null && result.exit_code !== 0) ? 'error' : 'done';
+  } catch { return step.status; }
+}
+
 export function mergeToolStep(previous, next) {
   const index = previous.findIndex(s => s.run_id === next.run_id && s.step === next.step);
   return index < 0 ? [...previous, next] : previous.map((s, i) => i === index ? {...s, ...next} : s);
@@ -8,10 +28,10 @@ export function mergeToolStep(previous, next) {
 export function ToolActivity({steps}) {
   if (!steps.length) return null;
   return <section className="tool-activity" aria-label="Code execution">
-    {steps.map(step => <details key={`${step.run_id}-${step.step}`} open={step.status === 'running'}>
-      <summary><span>{step.name === 'python' ? 'Python' : step.name === 'terminal' ? 'Terminal' : 'Save file'} · step {step.step}</span><b>{step.status}</b></summary>
+    {steps.map(step => <details key={`${step.run_id}-${step.step}`} data-status={executionStatus(step)} open={['running','error','failed'].includes(executionStatus(step))}>
+      <summary><span>{step.name === 'python' ? 'Python' : step.name === 'terminal' ? 'Terminal' : 'Save file'} · step {step.step}</span><b>{executionStatus(step)}</b></summary>
       <pre>{Object.values(step.arguments || {}).join('\n')}</pre>
-      {step.result && <pre className="tool-result">{step.result}</pre>}
+      {step.result && <pre className="tool-result">{readableResult(step.result)}</pre>}
     </details>)}
   </section>;
 }

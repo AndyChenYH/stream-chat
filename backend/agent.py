@@ -194,8 +194,11 @@ async def agent_generate(model, store, chat_id, run_id, messages, report, emit, 
                     await store.tool_step(run_id,steps,name,args,'failed',result_text)
                     await emit('tool',{'run_id':str(run_id),'step':steps,'name':name,'arguments':args,'status':'failed','result':result_text})
                     raise RuntimeError('Sandbox execution failed') from exc
-                await store.tool_step(run_id,steps,name,args,'done',result_text)
-                await emit('tool',{'run_id':str(run_id),'step':steps,'name':name,'arguments':args,'status':'done','result':result_text})
+                # A completed transport can still contain a Python error or nonzero exit.
+                # Preserve that distinction while allowing the model to repair its code.
+                status = 'error' if result.get('error') or result.get('exit_code',0) != 0 else 'done'
+                await store.tool_step(run_id,steps,name,args,status,result_text)
+                await emit('tool',{'run_id':str(run_id),'step':steps,'name':name,'arguments':args,'status':status,'result':result_text})
                 history.append({'role':'tool','tool_call_id':call['id'],'content':result_text})
             if text:
                 yield Chunk(text='\n\n')

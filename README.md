@@ -103,6 +103,8 @@ Diagnostics remain in browser memory for the latest request and reset on navigat
 
 ## Verified behavior
 
+E2B tools were tested end to end on 2026-09-19 against the deployed Fly API and Runpod model. A CSV task executed a terminal command, recovered from two Python errors, computed total 450 / average 150, generated a PNG plot and published a CSV. The saved answer, plot and file were fetched again after sandbox termination. Closing a second request immediately after sandbox creation persisted cancellation and left zero E2B sandboxes. A text-only request with Code tools enabled did not change sandbox usage. The two sandbox runs reserved 48 seconds after confirmed cleanup (about $0.0022 at the default compute rate). The initial GPU cold start took about 75 seconds; the analysis finished in 124 seconds. These are individual test measurements.
+
 The deployed path was tested on 2026-09-16 with Qwen3 4B on an RTX A5000:
 
 - Scale from zero running workers: 90.4 seconds to first token, 91.4 seconds to finish a short answer.

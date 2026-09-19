@@ -36,12 +36,15 @@ async def test_plain_answer_never_creates_sandbox():
 
 
 @pytest.mark.asyncio
-async def test_model_gets_real_tool_result_then_cleanup_precedes_done():
+@pytest.mark.parametrize('tool_result,expected_status', [({'stdout':'42'},'done'),
+    ({'stdout':'42','error':'NameError: missing_variable'},'error'),
+    ({'stdout':'42','exit_code':1},'error')])
+async def test_model_gets_real_tool_result_then_cleanup_precedes_done(tool_result,expected_status):
     closed, calls = [], []
     class Session:
         creating = None
         def __init__(self,*args): pass
-        async def execute(self,name,args): calls.append((name,args)); return {'stdout':'42'}
+        async def execute(self,name,args): calls.append((name,args)); return tool_result
         async def close(self): closed.append(True)
     class Model:
         async def generate(self,run_id,messages,report,enable_tools):
@@ -55,7 +58,7 @@ async def test_model_gets_real_tool_result_then_cleanup_precedes_done():
     store=Store()
     async for c in agent_generate(Model(),store,uuid4(),uuid4(),[{'role':'user','content':'calculate'}],noop,noop,Session):
         if c.done: assert closed and c.usage['total_tokens']==30
-    assert len(calls)==1 and store.steps[-1][4]=='done'
+    assert len(calls)==1 and store.steps[-1][4]==expected_status
 
 
 @pytest.mark.asyncio
