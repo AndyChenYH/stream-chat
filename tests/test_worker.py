@@ -110,3 +110,36 @@ def test_worker_reports_real_context_stages_and_final_token_usage():
     assert events[1][1]['prompt_tokens'] == 20
     assert events[-2] == ('usage', {'prompt_tokens':20,'completion_tokens':1,'total_tokens':21})
     assert events[-1][0] == 'done'
+
+
+@pytest.mark.parametrize('finish,ended,executable', [('tool_calls', True, True), ('length', True, False), ('tool_calls', False, False)])
+def test_native_tools_only_emitted_after_complete_validated_stream(finish, ended, executable):
+    def runtime(request):
+        if request.url.path in ('/tokenize', '/health'):
+            return runtime_reply(request)
+        assert json.loads(request.content)['tools'][0]['function']['name'] == 'terminal'
+        packets = [
+            {'choices': [{'delta': {'tool_calls': [{'index': 0, 'id': 'call_1',
+                'function': {'name': 'python', 'arguments': '{"code":'}}]}}]},
+            {'choices': [{'delta': {'tool_calls': [{'index': 0, 'function': {'arguments': '"print(2)"}'}}]}, 'finish_reason': finish}]},
+        ]
+        return httpx.Response(200, text=''.join('data: ' + json.dumps(p) + '\n\n' for p in packets)
+                              + ('data: [DONE]\n\n' if ended else ''))
+    runtime_client = httpx.AsyncClient(transport=httpx.MockTransport(runtime),base_url='http://localhost')
+    with TestClient(create_app(worker=Worker(client=runtime_client),service_key=KEY)) as client:
+        result = client.post('/generate',json={**payload(), 'enable_tools': True},headers={'X-Worker-Key':KEY})
+    assert ('event: tool_call' in result.text) == executable
+    assert ('event: error' in result.text) != executable
+
+
+def test_tool_results_require_matching_calls():
+    with pytest.raises(ValueError, match='Orphaned'):
+        Generate(**{**payload(), 'messages': [{'role': 'tool', 'tool_call_id': 'missing', 'content': '42'}]})
+
+
+@pytest.mark.asyncio
+async def test_context_does_not_drop_current_tool_chain():
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200,json={'count': 9000})),base_url='http://localhost') as client:
+        with pytest.raises(ValueError, match='context window'):
+            await Worker(client=client).fit_context([{'role':'user','content':'current'},
+                {'role':'assistant','content':'calling'}, {'role':'tool','content':'result'}],1024)

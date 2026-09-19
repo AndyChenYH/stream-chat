@@ -13,22 +13,47 @@ from pydantic import BaseModel, Field, model_validator
 from starlette.background import BackgroundTask
 from shared.events import sse
 from shared.limits import BodyLimit
+from shared.tools import TOOLS, AGENT_INSTRUCTIONS, validate_call
 
 
 class Message(BaseModel):
-    role: Literal['user', 'assistant']
-    content: str = Field(min_length=1, max_length=65536)
+    role: Literal['user', 'assistant', 'tool']
+    content: str | None = Field(default=None, max_length=65536)
+    tool_calls: list[dict] | None = Field(default=None, max_length=6)
+    tool_call_id: str | None = Field(default=None, max_length=128)
 
 
 class Generate(BaseModel):
     run_id: UUID
-    messages: list[Message] = Field(min_length=1, max_length=41)
+    messages: list[Message] = Field(min_length=1, max_length=60)
     max_tokens: int = Field(default=1024, ge=1, le=1024)
+    enable_tools: bool = False
 
     @model_validator(mode='after')
     def last_message_is_user(self):
-        if self.messages[-1].role != 'user':
-            raise ValueError('Last message must be a user prompt')
+        if self.messages[-1].role not in ('user', 'tool'):
+            raise ValueError('Last message must be a user prompt or tool result')
+        pending = set()
+        for message in self.messages:
+            if message.role == 'tool':
+                if message.tool_call_id not in pending or message.content is None:
+                    raise ValueError('Orphaned tool result')
+                pending.remove(message.tool_call_id)
+            else:
+                if pending:
+                    raise ValueError('Missing tool result')
+                if message.tool_calls:
+                    if message.role != 'assistant':
+                        raise ValueError('Only assistants call tools')
+                    for call in message.tool_calls:
+                        validate_call(call)
+                        if call['id'] in pending:
+                            raise ValueError('Duplicate tool call')
+                        pending.add(call['id'])
+                elif not message.content:
+                    raise ValueError('Empty message')
+        if pending:
+            raise ValueError('Missing tool result')
         return self
 
 
@@ -44,36 +69,41 @@ class Worker:
         except httpx.HTTPError:
             return False
 
-    async def fit_context(self, messages, max_tokens, with_tokens=False):
-        messages = [{'role': 'system', 'content': 'You are a helpful assistant. Answer clearly and accurately.'}] + messages
+    async def fit_context(self, messages, max_tokens, with_tokens=False, enable_tools=False):
+        messages = [{'role': 'system', 'content': 'You are a helpful assistant. Answer clearly and accurately.'
+                     + ('\n' + AGENT_INSTRUCTIONS if enable_tools else '')}] + messages
         while True:
             response = await self.client.post('/tokenize', json={
-                'model': self.model, 'messages': messages, 'add_generation_prompt': True})
+                'model': self.model, 'messages': messages, 'add_generation_prompt': True,
+                **({'tools': TOOLS} if enable_tools else {})})
             response.raise_for_status()
             if response.json()['count'] + max_tokens <= int(os.environ.get('MAX_MODEL_LEN', '8192')):
                 return (messages, response.json()['count']) if with_tokens else messages
-            if len(messages) <= 2:
+            # Drop an entire previous user turn; never orphan the current tool chain.
+            next_user = next((i for i in range(2, len(messages)) if messages[i]['role'] == 'user'), None)
+            if next_user is None:
                 raise ValueError('Prompt exceeds model context window')
-            del messages[1]
-            while len(messages) > 2 and messages[1]['role'] != 'user':
-                del messages[1]
+            del messages[1:next_user]
 
     async def generate(self, request, ticket):
         try:
             async with asyncio.timeout(180):
                 yield sse('status', {'stage': 'tokenizing', 'context_messages': len(request.messages)})
                 messages, prompt_tokens = await self.fit_context(
-                    [m.model_dump() for m in request.messages], request.max_tokens, with_tokens=True)
+                    [m.model_dump(exclude_none=True) for m in request.messages], request.max_tokens,
+                    with_tokens=True, enable_tools=request.enable_tools)
                 yield sse('status', {'stage': 'context_ready', 'prompt_tokens': prompt_tokens,
                     'context_messages': len(messages), 'trimmed_messages': len(request.messages) + 1 - len(messages)})
                 yield sse('status', {'stage': 'runtime_request'})
                 async with self.client.stream('POST', '/v1/chat/completions', json={
                     'model': self.model, 'messages': messages, 'stream': True,
                     'stream_options': {'include_usage': True},
-                    'max_tokens': request.max_tokens, 'temperature': 0.7}) as response:
+                    'max_tokens': request.max_tokens, 'temperature': 0.7,
+                    **({'tools': TOOLS, 'tool_choice': 'auto', 'parallel_tool_calls': False}
+                       if request.enable_tools else {})}) as response:
                     response.raise_for_status()
                     yield sse('status', {'stage': 'runtime_stream_open', 'http_status': response.status_code})
-                    reason, ended = None, False
+                    reason, ended, calls = None, False, {}
                     async for line in response.aiter_lines():
                         if not line.startswith('data:'):
                             continue
@@ -88,12 +118,36 @@ class Worker:
                             yield sse('usage', {k: v for k, v in packet['usage'].items()
                                 if k in ('prompt_tokens', 'completion_tokens', 'total_tokens') and type(v) is int})
                         for choice in packet.get('choices', []):
+                            for delta in choice.get('delta', {}).get('tool_calls', []):
+                                index = delta.get('index')
+                                if not request.enable_tools or type(index) is not int or not 0 <= index < 6:
+                                    raise ValueError('Invalid tool call index')
+                                call = calls.setdefault(index, {'id': '', 'type': 'function',
+                                    'function': {'name': '', 'arguments': ''}})
+                                if delta.get('id'):
+                                    call['id'] += delta['id']
+                                for key in ('name', 'arguments'):
+                                    call['function'][key] += delta.get('function', {}).get(key) or ''
+                                if len(json.dumps(call)) > 17000:
+                                    raise ValueError('Tool call too large')
                             if text := choice.get('delta', {}).get('content'):
                                 yield sse('token', {'text': text})
                             if choice.get('finish_reason'):
                                 reason = choice['finish_reason']
-                    if not ended or reason not in ('stop', 'length'):
+                    if not ended or reason not in ('stop', 'length', 'tool_calls'):
                         raise RuntimeError('Incomplete model stream')
+                    if calls or reason == 'tool_calls':
+                        if reason != 'tool_calls' or not calls:
+                            raise ValueError('Incomplete tool call')
+                        ids = set()
+                        for call in calls.values():
+                            validate_call(call)
+                            if call['id'] in ids:
+                                raise ValueError('Duplicate tool call ID')
+                            ids.add(call['id'])
+                        # Emit nothing executable until the entire runtime stream validates.
+                        for call in calls.values():
+                            yield sse('tool_call', call)
                     yield sse('done', {'finish_reason': reason})
         except asyncio.CancelledError:
             raise  # Closing the runtime stream cancels inference.

@@ -9,6 +9,7 @@ class Chunk:
     finish_reason: str = ''
     started: bool = False
     usage: dict | None = None
+    tool_call: dict | None = None
 
 
 def sse(event, data):
