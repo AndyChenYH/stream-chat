@@ -3,13 +3,14 @@ export async function readEvents(body, onEvent) {
   const decoder = new TextDecoder();
   let buffer = '', terminal = false;
   function consume(frame) {
-    let event = 'message'; const data = [];
+    let event = 'message', id = null; const data = [];
     for (const line of frame.split('\n')) {
       if (line.startsWith('event:')) event = line.slice(6).trim();
+      if (line.startsWith('id:')) id = Number(line.slice(3).trim());
       if (line.startsWith('data:')) data.push(line.slice(5).trimStart());
     }
     if (!data.length) return;
-    onEvent(event, JSON.parse(data.join('\n')));
+    onEvent(event, JSON.parse(data.join('\n')), id);
     if (event === 'done' || event === 'error') terminal = true;
   }
   try {

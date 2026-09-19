@@ -19,16 +19,26 @@ plt.show() automatically saves PNG plots. Explain results and failures honestly.
 
 
 def validate_call(call):
+    validate_envelope(call)
+    fn = call['function']
+    key = {'terminal': 'command', 'python': 'code', 'publish_file': 'path'}.get(fn.get('name'))
+    if key is None:
+        raise ValueError('Unknown tool')
+    args = json.loads(fn['arguments'])
+    if not isinstance(args, dict) or set(args) != {key} or not isinstance(args[key], str) or not args[key].strip():
+        raise ValueError('Invalid tool arguments')
+    return fn['name'], args
+
+
+def validate_envelope(call):
+    """Transport validation only; agent-specific argument validation happens before execution."""
     if not isinstance(call, dict) or call.get('type') != 'function':
         raise ValueError('Invalid tool call')
     if not isinstance(call.get('id'), str) or not 1 <= len(call['id']) <= 128:
         raise ValueError('Invalid tool call ID')
     fn = call.get('function', {})
-    key = {'terminal': 'command', 'python': 'code', 'publish_file': 'path'}.get(fn.get('name'))
+    if not isinstance(fn, dict) or not isinstance(fn.get('name'), str) or not 1 <= len(fn['name']) <= 64:
+        raise ValueError('Invalid tool name')
     raw = fn.get('arguments')
-    if key is None or not isinstance(raw, str) or len(raw) > 16000:
-        raise ValueError('Unknown tool or oversized arguments')
-    args = json.loads(raw)
-    if not isinstance(args, dict) or set(args) != {key} or not isinstance(args[key], str) or not args[key].strip():
-        raise ValueError('Invalid tool arguments')
-    return fn['name'], args
+    if not isinstance(raw, str) or len(raw) > 16000:
+        raise ValueError('Oversized arguments')

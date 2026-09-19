@@ -3,6 +3,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY shared shared
+COPY agent_sdk agent_sdk
 COPY backend backend
 RUN useradd --uid 10001 --create-home app
 USER app

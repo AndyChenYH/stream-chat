@@ -13,3 +13,13 @@ test('an abruptly ended stream cannot be mistaken for success', async () => {
   const stream = new ReadableStream({start(c){c.enqueue(new TextEncoder().encode('event: token\ndata: {"text":"partial"}\n\n'));c.close()}});
   await assert.rejects(readEvents(stream,()=>{}), /interrupted/);
 });
+
+test('durable event sequence IDs are delivered for reconnect deduplication', async () => {
+  const frames=[];
+  const body=new ReadableStream({start(controller){
+    controller.enqueue(new TextEncoder().encode('id: 18\nevent: token\ndata: {"text":"ok"}\n\nid: 19\nevent: done\ndata: {}\n\n'));
+    controller.close();
+  }});
+  await readEvents(body,(event,data,id)=>frames.push({event,data,id}));
+  assert.deepEqual(frames.map(f=>f.id),[18,19]);
+});

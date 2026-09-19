@@ -4,7 +4,7 @@ import os
 import re
 import httpx
 from shared.events import Chunk, read_events
-from shared.tools import validate_call
+from shared.tools import validate_call, validate_envelope
 
 
 async def ignore_status(stage, **details):
@@ -93,17 +93,22 @@ class Model:
                 await report('retry_delay', retry_in_s=self.retry_delay, attempt=attempt)
                 await asyncio.sleep(self.retry_delay)
 
-    async def generate(self, run_id, messages, report=None, enable_tools=False):
+    async def generate(self, run_id, messages, report=None, enable_tools=False, agent=None, tools=None):
         report = report or ignore_status
         await self.wait_until_ready(report)
         yield Chunk(started=True)
-        await report('generation_request', max_output_tokens=1024)
+        await report('generation_request', max_output_tokens=agent['limits']['max_output_tokens'] if agent else 1024)
         # Replaying an ambiguous generation POST can bill twice or change the answer.
         async with asyncio.timeout(180):
             async with self.client.stream('POST', '/generate', json={
                 'run_id': str(run_id), 'messages': messages, 'max_tokens': 1024,
-                'enable_tools': enable_tools}) as response:
+                'enable_tools': enable_tools,
+                **({'system_prompt': agent['system_prompt'], 'tools': tools or [],
+                    'max_tokens': agent['limits']['max_output_tokens'],
+                    'output_schema': agent.get('output_schema')} if agent else {})}) as response:
                 response.raise_for_status()
+                if agent and response.headers.get('x-agent-protocol') != '1':
+                    raise RuntimeError('Deploy a worker supporting agent protocol 1 before enabling Temporal')
                 if not response.headers.get('content-type', '').startswith('text/event-stream'):
                     raise RuntimeError('Expected a streaming worker response')
                 await report('worker_stream_open', http_status=response.status_code)
@@ -136,7 +141,7 @@ class Model:
                     elif event == 'tool_call':
                         if not enable_tools or len(calls) >= 6:
                             raise RuntimeError('Unexpected tool call')
-                        validate_call(data)
+                        (validate_envelope if agent else validate_call)(data)
                         if any(c['id'] == data['id'] for c in calls):
                             raise RuntimeError('Duplicate tool call')
                         calls.append(data)

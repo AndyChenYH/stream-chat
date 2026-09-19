@@ -143,3 +143,24 @@ async def test_context_does_not_drop_current_tool_chain():
         with pytest.raises(ValueError, match='context window'):
             await Worker(client=client).fit_context([{'role':'user','content':'current'},
                 {'role':'assistant','content':'calling'}, {'role':'tool','content':'result'}],1024)
+
+
+def test_agent_prompt_allowlist_and_output_schema_reach_vllm():
+    from backend.agents import COMPILED
+    from backend.tools import TOOLS
+    seen=[]
+    def runtime(request):
+        if request.method=='POST': seen.append(json.loads(request.content))
+        return runtime_reply(request)
+    runtime_client=httpx.AsyncClient(transport=httpx.MockTransport(runtime),base_url='http://localhost')
+    with TestClient(create_app(worker=Worker(client=runtime_client),service_key=KEY)) as client:
+        response=client.post('/generate',headers={'X-Worker-Key':KEY},json={**payload(),
+            'system_prompt':'Custom system prompt','enable_tools':True,'tools':TOOLS.schemas(['python'])})
+        assert response.headers['x-agent-protocol']=='1'
+        assert all(p['messages'][0]['content']=='Custom system prompt' for p in seen)
+        assert all([t['function']['name'] for t in p['tools']]==['python'] for p in seen)
+        seen.clear()
+        schema={'type':'object','properties':{'answer':{'type':'integer'}},'required':['answer']}
+        client.post('/generate',headers={'X-Worker-Key':KEY},json={**payload(),
+            'system_prompt':'Return JSON','tools':[],'output_schema':schema})
+        assert seen[-1]['response_format']['json_schema']['schema']==schema

@@ -30,3 +30,13 @@ watchfiles==1.2.0
 websockets==17.1
 e2b-code-interpreter==2.10.0
 e2b==2.51.0
+
+temporalio==1.33.0
+jsonschema==4.26.0
+attrs==26.1.0
+jsonschema-specifications==2025.9.1
+referencing==0.37.0
+rpds-py==2026.6.3
+nexus-rpc==1.4.0
+protobuf==7.36.1
+types-protobuf==7.35.1.20260906

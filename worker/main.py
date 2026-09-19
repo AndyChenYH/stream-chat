@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field, model_validator
 from starlette.background import BackgroundTask
 from shared.events import sse
 from shared.limits import BodyLimit
-from shared.tools import TOOLS, AGENT_INSTRUCTIONS, validate_call
+from shared.tools import TOOLS, AGENT_INSTRUCTIONS, validate_call, validate_envelope
 
 
 class Message(BaseModel):
@@ -28,6 +28,9 @@ class Generate(BaseModel):
     messages: list[Message] = Field(min_length=1, max_length=60)
     max_tokens: int = Field(default=1024, ge=1, le=1024)
     enable_tools: bool = False
+    system_prompt: str | None = Field(default=None, min_length=1, max_length=16000)
+    tools: list[dict] | None = Field(default=None, max_length=6)
+    output_schema: dict | None = None
 
     @model_validator(mode='after')
     def last_message_is_user(self):
@@ -46,7 +49,7 @@ class Generate(BaseModel):
                     if message.role != 'assistant':
                         raise ValueError('Only assistants call tools')
                     for call in message.tool_calls:
-                        validate_call(call)
+                        (validate_envelope if self.system_prompt is not None else validate_call)(call)
                         if call['id'] in pending:
                             raise ValueError('Duplicate tool call')
                         pending.add(call['id'])
@@ -69,13 +72,14 @@ class Worker:
         except httpx.HTTPError:
             return False
 
-    async def fit_context(self, messages, max_tokens, with_tokens=False, enable_tools=False):
-        messages = [{'role': 'system', 'content': 'You are a helpful assistant. Answer clearly and accurately.'
-                     + ('\n' + AGENT_INSTRUCTIONS if enable_tools else '')}] + messages
+    async def fit_context(self, messages, max_tokens, with_tokens=False, enable_tools=False, system_prompt=None, tools=None):
+        tools = TOOLS if tools is None else tools
+        messages = [{'role': 'system', 'content': system_prompt or ('You are a helpful assistant. Answer clearly and accurately.'
+                     + ('\n' + AGENT_INSTRUCTIONS if enable_tools else ''))}] + messages
         while True:
             response = await self.client.post('/tokenize', json={
                 'model': self.model, 'messages': messages, 'add_generation_prompt': True,
-                **({'tools': TOOLS} if enable_tools else {})})
+                **({'tools': tools} if enable_tools else {})})
             response.raise_for_status()
             if response.json()['count'] + max_tokens <= int(os.environ.get('MAX_MODEL_LEN', '8192')):
                 return (messages, response.json()['count']) if with_tokens else messages
@@ -91,7 +95,8 @@ class Worker:
                 yield sse('status', {'stage': 'tokenizing', 'context_messages': len(request.messages)})
                 messages, prompt_tokens = await self.fit_context(
                     [m.model_dump(exclude_none=True) for m in request.messages], request.max_tokens,
-                    with_tokens=True, enable_tools=request.enable_tools)
+                    with_tokens=True, enable_tools=request.enable_tools,
+                    system_prompt=request.system_prompt, tools=request.tools)
                 yield sse('status', {'stage': 'context_ready', 'prompt_tokens': prompt_tokens,
                     'context_messages': len(messages), 'trimmed_messages': len(request.messages) + 1 - len(messages)})
                 yield sse('status', {'stage': 'runtime_request'})
@@ -99,8 +104,10 @@ class Worker:
                     'model': self.model, 'messages': messages, 'stream': True,
                     'stream_options': {'include_usage': True},
                     'max_tokens': request.max_tokens, 'temperature': 0.7,
-                    **({'tools': TOOLS, 'tool_choice': 'auto', 'parallel_tool_calls': False}
-                       if request.enable_tools else {})}) as response:
+                    **({'tools': request.tools if request.tools is not None else TOOLS, 'tool_choice': 'auto', 'parallel_tool_calls': False}
+                       if request.enable_tools else {}),
+                    **({'response_format': {'type': 'json_schema', 'json_schema': {'name': 'agent_output',
+                        'schema': request.output_schema}}} if request.output_schema and not request.enable_tools else {})}) as response:
                     response.raise_for_status()
                     yield sse('status', {'stage': 'runtime_stream_open', 'http_status': response.status_code})
                     reason, ended, calls = None, False, {}
@@ -141,7 +148,7 @@ class Worker:
                             raise ValueError('Incomplete tool call')
                         ids = set()
                         for call in calls.values():
-                            validate_call(call)
+                            (validate_envelope if request.system_prompt is not None else validate_call)(call)
                             if call['id'] in ids:
                                 raise ValueError('Duplicate tool call ID')
                             ids.add(call['id'])
@@ -198,7 +205,7 @@ def create_app(worker=None, service_key=None):
             await runtime.release(ticket)
             raise
         return StreamingResponse(runtime.generate(request, ticket), media_type='text/event-stream',
-            headers={'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no'},
+            headers={'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no', 'X-Agent-Protocol': '1'},
             background=BackgroundTask(runtime.release, ticket))
 
     return app

@@ -32,6 +32,7 @@ class Prompt(BaseModel):
     request_id: UUID
     content: str = Field(min_length=1, max_length=4096)
     enable_tools: bool = False
+    agent: str | None = Field(default=None, max_length=64)
 
     @field_validator('content')
     @classmethod
@@ -159,20 +160,29 @@ class Job:
                 await self.stop()
 
 
-def create_app(store=None, model=None, access_key=None, origins=None):
+def create_app(store=None, model=None, access_key=None, origins=None, temporal_client=None, sandbox_type=None):
     key = access_key or os.environ['CHAT_ACCESS_KEY']
     if len(key) < 32:
         raise RuntimeError('CHAT_ACCESS_KEY must contain at least 32 random characters')
     gate, jobs = Gate(waiting_limit=5), set()
+    durable = temporal_client is not None or bool(os.environ.get('TEMPORAL_ADDRESS'))
 
     @contextlib.asynccontextmanager
     async def lifespan(app):
-        app.state.store = store or Store(os.environ['DATABASE_URL'])
+        from backend.durable_store import DurableStore
+        app.state.store = store or (DurableStore if durable else Store)(os.environ['DATABASE_URL'])
         await app.state.store.open()
         app.state.model = model or Model()
+        app.state.runtime = None
+        if durable:
+            from backend.temporal_runtime import TemporalRuntime
+            app.state.runtime = TemporalRuntime(app.state.store, app.state.model, temporal_client, sandbox_type)
+            await app.state.runtime.start()
         try:
             yield
         finally:
+            if app.state.runtime:
+                await app.state.runtime.close()
             await asyncio.gather(*(job.stop() for job in list(jobs)))
             await app.state.model.close()
             await app.state.store.close()
@@ -206,7 +216,13 @@ def create_app(store=None, model=None, access_key=None, origins=None):
         except Exception:
             result = {'ready': False, 'model': 'unavailable'}
         tools_configured = bool(os.environ.get('E2B_API_KEY'))
-        return {**result, 'active': min(len(gate.tickets), 1), 'queued': max(len(gate.tickets) - 1, 0),
+        if durable:
+            rows = await app.state.store.pending_runs()
+            counts = {'active':sum(r['status']=='streaming' for r in rows), 'queued':sum(r['status']=='queued' for r in rows)}
+        else:
+            counts = {'active':min(len(gate.tickets),1), 'queued':max(len(gate.tickets)-1,0)}
+        return {**result, **counts, 'durable_execution':durable,
+            'temporal_connected':app.state.runtime.connected if durable else False,
             'tools_configured':tools_configured,
             'sandbox_budget':await app.state.store.sandbox_budget() if tools_configured else None}
 
@@ -231,6 +247,25 @@ def create_app(store=None, model=None, access_key=None, origins=None):
             raise HTTPException(404, 'Conversation not found')
         if prompt.enable_tools and not os.environ.get('E2B_API_KEY'):
             raise HTTPException(503,'Code tools are not configured')
+        if durable:
+            from backend.agents import COMPILED
+            name = prompt.agent or ('analyst' if prompt.enable_tools else 'chat')
+            if name not in COMPILED:
+                raise HTTPException(400,'Unknown agent')
+            config = COMPILED[name]
+            if config['tools'] and not os.environ.get('E2B_API_KEY'):
+                raise HTTPException(503,'Code tools are not configured')
+            try:
+                await db.accept_run(chat_id, prompt.request_id, prompt.content, config)
+            except ConversationBusy:
+                raise HTTPException(409,'This conversation already has an active run')
+            except QueueFull:
+                raise HTTPException(429,'One agent is active and five are waiting. Try again shortly.')
+            except ValueError as exc:
+                raise HTTPException(409,str(exc))
+            app.state.runtime.notify()
+            return StreamingResponse(app.state.runtime.stream(prompt.request_id), media_type='text/event-stream',
+                headers={'X-Accel-Buffering':'no', 'Cache-Control':'no-store'})
         try:
             ticket = gate.reserve(str(chat_id))
         except ConversationBusy:
@@ -253,6 +288,31 @@ def create_app(store=None, model=None, access_key=None, origins=None):
         return StreamingResponse(job.stream(), media_type='text/event-stream',
             headers={'X-Accel-Buffering': 'no', 'Cache-Control': 'no-store'}, background=BackgroundTask(job.stop))
 
+    @app.get('/v1/agents', dependencies=[Depends(auth)])
+    async def agents():
+        from backend.agents import COMPILED
+        return [{'name':a['name'],'version':a['version'],'tools':[t['function']['name'] for t in a['tools']],
+                 'limits':a['limits']} for a in COMPILED.values()]
+
+    @app.get('/v1/conversations/{chat_id}/active-run', dependencies=[Depends(auth)])
+    async def active_run(chat_id: UUID):
+        return await app.state.store.chat_run(chat_id) if durable else None
+
+    @app.get('/v1/runs/{run_id}/events', dependencies=[Depends(auth)])
+    async def run_events(run_id: UUID, after: int = Query(0,ge=0)):
+        if not durable or not await app.state.store.get_run(run_id):
+            raise HTTPException(404,'Run not found')
+        return StreamingResponse(app.state.runtime.stream(run_id,after),media_type='text/event-stream',
+            headers={'X-Accel-Buffering':'no','Cache-Control':'no-store'})
+
+    @app.post('/v1/runs/{run_id}/cancel', dependencies=[Depends(auth)])
+    async def cancel_run(run_id: UUID):
+        if not durable or not (run := await app.state.store.get_run(run_id)):
+            raise HTTPException(404,'Run not found')
+        await app.state.store.request_cancel(run_id)
+        app.state.runtime.notify()
+        return {'cancel_requested':run['status'] in ('queued','streaming'),'status':run['status']}
+
     @app.get('/v1/conversations/{chat_id}/tools', dependencies=[Depends(auth)])
     async def tools(chat_id: UUID):
         return await app.state.store.tools(chat_id)
@@ -266,6 +326,8 @@ def create_app(store=None, model=None, access_key=None, origins=None):
         if not await app.state.store.exists(chat_id):
             raise HTTPException(404,'Conversation not found')
         if any(t.conversation_id == str(chat_id) for t in gate.tickets):
+            raise HTTPException(409,'Wait for this conversation to finish before adding files')
+        if durable and await app.state.store.chat_run(chat_id):
             raise HTTPException(409,'Wait for this conversation to finish before adding files')
         try:
             data = base64.b64decode(file.data,validate=True)

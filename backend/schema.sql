@@ -50,3 +50,21 @@ CREATE TABLE IF NOT EXISTS artifacts (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS artifacts_conversation ON artifacts(conversation_id, created_at);
+
+-- Additive migration: legacy requests retain their original restart behavior.
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS engine text;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS agent_config jsonb;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS expires_at timestamptz;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS dispatched_at timestamptz;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS cancel_requested boolean NOT NULL DEFAULT false;
+CREATE INDEX IF NOT EXISTS runs_pending_dispatch ON runs(created_at) WHERE engine='temporal-v1' AND dispatched_at IS NULL;
+CREATE TABLE IF NOT EXISTS run_events (
+  seq bigserial PRIMARY KEY,
+  run_id uuid NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  event_key text NOT NULL,
+  event text NOT NULL,
+  data jsonb NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE(run_id, event_key)
+);
+CREATE INDEX IF NOT EXISTS run_events_reconnect ON run_events(run_id,seq);

@@ -25,8 +25,8 @@ class Store:
             max_inactive_connection_lifetime=30, timeout=20, command_timeout=15, ssl=self.ssl)
         async with self.pool.acquire() as db, db.transaction():
             await db.execute(Path(__file__).with_name('schema.sql').read_text())
-            await db.execute("UPDATE runs SET status='interrupted', finished_at=now() WHERE status IN ('queued','streaming')")
-            await db.execute("UPDATE tool_steps SET status='interrupted' WHERE status='running'")
+            await db.execute("UPDATE runs SET status='interrupted', finished_at=now() WHERE engine IS NULL AND status IN ('queued','streaming')")
+            await db.execute("UPDATE tool_steps SET status='interrupted' WHERE status='running' AND run_id IN (SELECT id FROM runs WHERE engine IS NULL)")
 
     async def close(self):
         await self.pool.close()

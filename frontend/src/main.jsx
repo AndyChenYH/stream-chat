@@ -29,6 +29,7 @@ function App() {
   const [moreChats, setMoreChats] = useState(false);
   const [moreMessages, setMoreMessages] = useState(false);
   const abort = useRef(null), bottom = useRef(null), selected = useRef(null);
+  const activeRun = useRef(null);
 
   async function api(path, options = {}, access = key) {
     const response = await fetch(API + path, {...options, headers: {
@@ -58,13 +59,72 @@ function App() {
     try {
       const before = older && messages.length ? `?before=${messages[0].seq}` : '';
       const rows = await (await api(`/v1/conversations/${item.id}/messages${before}`)).json();
-      const [steps,attachments] = await Promise.all([
+      const [steps,attachments,active] = await Promise.all([
         api(`/v1/conversations/${item.id}/tools`).then(r=>r.json()),
-        api(`/v1/conversations/${item.id}/files`).then(r=>r.json())]);
+        api(`/v1/conversations/${item.id}/files`).then(r=>r.json()),
+        model?.durable_execution ? api(`/v1/conversations/${item.id}/active-run`).then(r=>r.json()) : null]);
       if (selected.current !== item.id) return;
       setToolSteps(steps); setFiles(attachments);
       setMenuOpen(false); setChat(item); setMessages(old => older ? [...rows, ...old] : rows); setMoreMessages(rows.length === 100);
+      if (active && !older) void resumeRun(active.id);
     } catch(e) { setError(e.message); } finally { if (selected.current === item.id) setLoading(false); }
+  }
+  async function watchRun(response, requestId, assistantId) {
+    let cursor = 0, failures = 0, reload = false;
+    const observe = (event, data = {}) => setTrace(current => recordTrace(current, event, data));
+    while (true) {
+      try {
+        if (!response) response=await api(`/v1/runs/${requestId}/events?after=${cursor}`,{signal:abort.current.signal});
+        await readEvents(response.body, (event, data, id) => {
+          if (id && id <= cursor) return;
+          if (id) cursor = id;
+          observe(event, data);
+          if (event === 'queued') setPhase(data.position ? `Queued · ${data.position} ahead` : 'Preparing');
+          if (event === 'starting') setPhase('Starting model…');
+          if (event === 'started') setPhase('Generating');
+          if (event === 'tool') setToolSteps(old=>mergeToolStep(old,data));
+          if (event === 'artifact') setFiles(old=>old.some(f=>f.id===data.id) ? old : [...old,data]);
+          if (event === 'replace') setMessages(old=>old.map(m=>m.id===assistantId ? {...m,content:data.text} : m));
+          if (event === 'token') setMessages(old=>old.map(m=>m.id===assistantId ? {...m,content:m.content+data.text} : m));
+          if (event === 'done' || event === 'error') {
+            reload = !!data.reload;
+            setMessages(old=>old.map(m=>m.run_id===requestId ? {...m,run_status:data.run_status || (event==='done'?'done':'failed'),
+              ...(m.id===assistantId ? {pending:false,incomplete:event==='error'} : {})} : m));
+            setPhase(event==='done' ? 'Saved' : data.run_status==='cancelled' ? 'Cancelled' : 'Failed');
+            if (event==='error') setError(data.message);
+          }
+        });
+        if (reload && selected.current) setMessages(await (await api(`/v1/conversations/${selected.current}/messages`)).json());
+        return;
+      } catch(e) {
+        if (!model?.durable_execution || e.name==='AbortError' || ++failures>5) throw e;
+        observe('browser',{stage:'reconnecting',attempt:failures});
+        setPhase('Reconnecting · agent continues on the server');
+        response=null;
+        await new Promise(resolve=>setTimeout(resolve,Math.min(failures*1000,5000)));
+      }
+    }
+  }
+  async function resumeRun(requestId) {
+    setBusy(true); activeRun.current=requestId; abort.current=new AbortController();
+    const assistantId=`pending-${requestId}`;
+    setTrace(createTrace(requestId));
+    setMessages(old=>[...old.filter(m=>!(m.role==='assistant' && m.run_id===requestId)),
+      {id:assistantId,run_id:requestId,role:'assistant',content:'',pending:true}]);
+    try {
+      const response=await api(`/v1/runs/${requestId}/events`,{signal:abort.current.signal});
+      await watchRun(response,requestId,assistantId);
+    } catch(e) {setError('Connection interrupted. The agent can continue; reload history to reconnect.');}
+    finally {activeRun.current=null;abort.current=null;setBusy(false);await refresh().catch(()=>{});}
+  }
+  async function stopRun() {
+    if (model?.durable_execution && activeRun.current) {
+      try {
+        await api(`/v1/runs/${activeRun.current}/cancel`,{method:'POST'});
+        setPhase('Cancellation requested · waiting for cleanup');
+        setTrace(current=>recordTrace(current,'browser',{stage:'cancellation_requested'}));
+      } catch(e) {setError(`Could not request cancellation: ${e.message}`);}
+    } else abort.current?.abort();
   }
   function newChat() { setToolSteps([]); setFiles([]); setTrace(null); setPhase(''); setMenuOpen(false); selected.current = null; setChat(null); setMessages([]); setMoreMessages(false); setPrompt(''); setError(''); }
   async function upload(event) {
@@ -102,29 +162,17 @@ function App() {
       const response = await api(`/v1/conversations/${current.id}/messages`, {
         method:'POST', body:JSON.stringify({request_id:requestId, content:text,enable_tools:toolsEnabled && !!model?.tools_configured}), signal:abort.current.signal});
       accepted = true; setPrompt('');
+      activeRun.current=requestId;
       observe('browser', {stage:'stream_connected'});
       setMessages(old => [...old, {id:requestId,run_id:requestId, role:'user', content:text}, {id:assistantId,run_id:requestId, role:'assistant', content:'', pending:true}]);
-      await readEvents(response.body, (event, data) => {
-        observe(event, data);
-        if (event === 'queued') setPhase(data.position ? `Queued · ${data.position} ahead` : 'Preparing');
-        if (event === 'starting') setPhase('Starting model… The first response may take a few minutes');
-        if (event === 'started') setPhase('Generating');
-        if (event === 'tool') setToolSteps(old=>mergeToolStep(old,data));
-        if (event === 'artifact') setFiles(old=>[...old,data]);
-        if (event === 'token') setMessages(old => old.map(m => m.id === assistantId ? {...m, content:m.content + data.text} : m));
-        if (event === 'done') {
-          setMessages(old => old.map(m => m.id === assistantId ? {...m, pending:false} : m));
-          setPhase(data.finish_reason === 'length' ? 'Response limit reached' : 'Saved');
-        }
-        if (event === 'error') throw new Error(data.message);
-      });
+      await watchRun(response,requestId,assistantId);
     } catch(e) {
       observe('browser', {stage:e.name === 'AbortError' ? 'cancelled' : 'error', message:e.message});
-      setError(e.name === 'AbortError' ? 'Generation stopped. Partial text is not saved; reload history to check the final state.' : e.message);
+      setError(model?.durable_execution ? 'Connection interrupted. The request may still be running; reload history before retrying.' : e.name==='AbortError' ? 'Generation stopped. Reload history to confirm its final state.' : e.message);
       if (accepted) setMessages(old => old.map(m => m.id === assistantId ? {...m, pending:false, incomplete:true} : m));
       setPhase('');
     } finally {
-      abort.current = null; setBusy(false);
+      abort.current = null; activeRun.current=null; setBusy(false);
       await refresh().catch(e => setError(e.message));
       await api('/v1/status').then(r=>r.json()).then(setModel).catch(()=>{});
     }
@@ -159,11 +207,12 @@ function App() {
       <div className="tool-controls"><label><input type="checkbox" checked={toolsEnabled && !!model?.tools_configured} disabled={busy || loading || !model?.tools_configured} onChange={e=>setToolsEnabled(e.target.checked)}/> Code tools</label>
         <label className="upload-button">＋ Add file<input type="file" aria-label="Add data file" disabled={busy || loading || !model?.tools_configured} onChange={upload}/></label>
         <small>{model?.tools_configured?'Starts only when called · stops after this task':'Code tools unavailable'}</small>
+        {model?.durable_execution && <small title="Execution belongs to the server. Reload this conversation on another device to follow the same run.">Temporal · {model.temporal_connected?'durable execution':'waiting for connection'} · closing this tab keeps the agent running</small>}
         {model?.sandbox_budget && <small title="Reserved sandbox time is counted conservatively, including uncertain cleanup. Limits persist across devices and backend restarts.">Sandbox use: {Math.ceil(model.sandbox_budget.daily_seconds/60)}/60 min today · {Math.ceil(model.sandbox_budget.total_seconds/60)}/600 min total</small>}
       </div>
       {files.some(f=>!f.run_id) && <details className="input-files"><summary>Conversation files · {files.filter(f=>!f.run_id).length}</summary>{files.filter(f=>!f.run_id).map(f=><Artifact key={f.id} file={f} api={api}/>)}<small>Files are sent to E2B only when a tool runs. 2 MB per file.</small></details>}
       <form className="composer" onSubmit={send}><textarea aria-label="Message" placeholder="Message Stream…" maxLength={4096} value={prompt} disabled={busy || loading} onChange={e=>setPrompt(e.target.value)} onKeyDown={e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.nativeEvent.isComposing){e.preventDefault();send(e)}}}/>
-        <div className="composer-bottom"><span>{busy?(trace?.title || phase):loading?'Loading…':phase || 'Shift + Enter for a new line'}</span>{busy?<button type="button" className="send" onClick={()=>abort.current?.abort()} aria-label="Stop generation">■</button>:<button className="send" disabled={!prompt.trim()||loading} aria-label="Send message">↑</button>}</div></form><p className="disclaimer">Answers can be imperfect. Check the details that matter.</p>
+        <div className="composer-bottom"><span>{busy?(trace?.title || phase):loading?'Loading…':phase || 'Shift + Enter for a new line'}</span>{busy?<button type="button" className="send" onClick={stopRun} aria-label="Stop generation">■</button>:<button className="send" disabled={!prompt.trim()||loading} aria-label="Send message">↑</button>}</div></form><p className="disclaimer">Answers can be imperfect. Check the details that matter.</p>
     </div></main></div>;
 }
 createRoot(document.getElementById('root')).render(<App/>);
