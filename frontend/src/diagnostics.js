@@ -13,7 +13,7 @@ function describe(stage, d) {
     submitting_prompt: ['Submitting and saving prompt', 'Waiting for API acceptance and the Postgres commit.'],
     stream_connected: ['Browser stream connected', 'Fly accepted the prompt and opened the SSE connection.'],
     prompt_saved: ['Prompt saved in Neon', 'The user message is committed before model startup.'],
-    queued: [d.position ? `Queued · ${d.position} ahead at acceptance` : 'Accepted · waiting for the agent worker', 'Your prompt is saved. The queue allows one active run; model startup begins when the worker accepts it.'],
+    queued: [d.position ? `Queued · ${d.position} ahead` : 'Accepted · waiting for the agent worker', 'Your prompt is saved. The queue allows one active run; model startup begins when the worker accepts it.'],
     loading_history: ['Loading conversation history', 'Checking Postgres and selecting completed turns for model context.'],
     history_loaded: ['Conversation history loaded', `${d.context_messages} messages selected before worker context trimming.`],
     worker_startup: ['Starting the on-demand model', 'Requesting a Runpod worker and waiting for model readiness. A cold start can take minutes.'],
