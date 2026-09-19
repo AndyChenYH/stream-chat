@@ -82,7 +82,7 @@ async def temporal():
     if address:
         yield await Client.connect(address)
     elif os.environ.get('CI'):
-        async with await WorkflowEnvironment.start_local(dev_server_download_version='1.9.1') as env:
+        async with await WorkflowEnvironment.start_local(dev_server_download_version='v1.9.1') as env:
             yield env.client
     else:
         pytest.skip('Set TEST_TEMPORAL_ADDRESS or CI=1 to run real Temporal tests')
