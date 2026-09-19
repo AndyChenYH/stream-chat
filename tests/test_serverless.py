@@ -1,8 +1,10 @@
 import asyncio
+import json
 from uuid import uuid4
 import httpx
 import pytest
 from backend.model import Model
+from shared.events import sse
 
 
 def model(client,**kw):
@@ -131,3 +133,21 @@ async def test_worker_diagnostics_and_usage_are_forwarded_without_raw_fields():
     assert ('tokenizing', {'context_messages':3}) in reports
     assert result[-1].usage == {'prompt_tokens':20,'completion_tokens':1,'total_tokens':21}
     assert all('hidden' not in str(item) and item[0] != 'unknown-stage' for item in reports)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('suffix,valid', [(sse('done',{'finish_reason':'tool_calls'}),True),
+    ('',False),(sse('done',{'finish_reason':'tool_calls'})+sse('token',{'text':'late'}),False)])
+async def test_tool_calls_are_buffered_until_clean_worker_eof(suffix,valid):
+    call={'id':'call_1','type':'function','function':{'name':'python','arguments':json.dumps({'code':'print(42)'})}}
+    def handler(request):
+        if request.method=='GET': return httpx.Response(200)
+        return httpx.Response(200,headers={'content-type':'text/event-stream'},text=sse('tool_call',call)+suffix)
+    received=[]
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler),base_url='https://example.api.runpod.ai') as client:
+        try:
+            async for chunk in model(client).generate(uuid4(),[],enable_tools=True):
+                if chunk.tool_call: received.append(chunk.tool_call)
+        except RuntimeError:
+            assert not valid
+    assert bool(received)==valid

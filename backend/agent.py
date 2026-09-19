@@ -14,6 +14,7 @@ from e2b import CommandExitException
 from e2b_code_interpreter import AsyncSandbox
 from shared.events import Chunk
 from shared.tools import validate_call
+from backend.store import SandboxBudgetExceeded
 
 MAX_CALLS, SANDBOX_SECONDS, OUTPUT_LIMIT = 6, 180, 8000
 MAX_FILE = 2 * 1024 * 1024
@@ -186,7 +187,8 @@ async def agent_generate(model, store, chat_id, run_id, messages, report, emit, 
                 except Exception as exc:
                     # SDK errors can contain credentials/URLs; expose only their class.
                     result_text = json.dumps({'error':type(exc).__name__,
-                        'message':'Tool failed or exceeded its limits. Do not claim it succeeded.'})
+                        'message':str(exc) if isinstance(exc,SandboxBudgetExceeded) else
+                        'Tool failed or exceeded its limits. Do not claim it succeeded.'})
                     await session.close()
                     session.creating = None
                     await store.tool_step(run_id,steps,name,args,'failed',result_text)

@@ -7,6 +7,10 @@ import json
 import asyncpg
 
 
+class SandboxBudgetExceeded(ValueError):
+    pass
+
+
 class Store:
     def __init__(self, url):
         parts = urlsplit(url)
@@ -84,7 +88,7 @@ class Store:
                 COALESCE(sum(reserved_seconds) FILTER (WHERE created_at > now()-interval '24 hours'),0) AS daily
                 FROM sandbox_usage''')
             if usage['total'] + seconds > 36000 or usage['daily'] + seconds > 3600:
-                raise ValueError('Sandbox usage allowance reached (1 hour per 24h, 10 hours total)')
+                raise SandboxBudgetExceeded('Sandbox usage allowance reached (1 hour per 24h, 10 hours total)')
             await db.execute('INSERT INTO sandbox_usage(run_id,reserved_seconds) VALUES($1,$2)',run_id,seconds)
 
     async def sandbox_created(self, run_id, sandbox_id):

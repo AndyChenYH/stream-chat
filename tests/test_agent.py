@@ -114,3 +114,23 @@ async def test_six_call_limit_forces_final_model_round_without_tools():
                 yield Chunk(done=True,finish_reason='stop')
     async for _ in agent_generate(Model(),Store(),uuid4(),uuid4(),[{'role':'user','content':'loop'}],noop,noop,Session): pass
     assert len(calls)==6
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_tool_execution_closes_session_and_marks_step():
+    entered,closed=asyncio.Event(),asyncio.Event()
+    class Session:
+        creating=None
+        def __init__(self,*args): pass
+        async def execute(self,*args): entered.set();await asyncio.Event().wait()
+        async def close(self): closed.set()
+    class Model:
+        async def generate(self,*args,**kwargs):
+            yield Chunk(tool_call=tool_call())
+            yield Chunk(done=True,finish_reason='tool_calls')
+    store=Store()
+    async def run():
+        async for _ in agent_generate(Model(),store,uuid4(),uuid4(),[{'role':'user','content':'test'}],noop,noop,Session): pass
+    task=asyncio.create_task(run());await entered.wait();task.cancel()
+    with pytest.raises(asyncio.CancelledError): await task
+    assert closed.is_set() and store.steps[-1][4]=='cancelled'
