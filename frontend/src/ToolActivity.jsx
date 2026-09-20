@@ -1,6 +1,6 @@
 import React, {useEffect, useState} from 'react';
 
-function readableResult(raw) {
+export function readableResult(raw) {
   try {
     const result=JSON.parse(raw);
     if ('stdout' in result || 'stderr' in result || 'error' in result) {
@@ -12,7 +12,7 @@ function readableResult(raw) {
   } catch { return raw; }
 }
 
-function executionStatus(step) {
+export function executionStatus(step) {
   if (step.status !== 'done' || !step.result) return step.status;
   try {
     const result=JSON.parse(step.result);
@@ -27,11 +27,13 @@ export function mergeToolStep(previous, next) {
 
 export function ToolActivity({steps}) {
   if (!steps.length) return null;
-  return <section className="tool-activity" aria-label="Code execution">
+  return <section className="tool-activity" aria-label="Agent tool activity">
+    <div className="activity-label">TOOL CALLS · {steps.length}</div>
     {steps.map(step => <details key={`${step.run_id}-${step.step}`} data-status={executionStatus(step)} open={['running','error','failed'].includes(executionStatus(step))}>
-      <summary><span>{step.name === 'python' ? 'Python' : step.name === 'terminal' ? 'Terminal' : 'Save file'} · step {step.step}</span><b>{executionStatus(step)}</b></summary>
+      <summary><span>{step.name === 'python' ? 'Python' : step.name === 'terminal' ? 'Terminal' : 'Save file'} · step {step.step}</span><b>{executionStatus(step) === 'error' ? 'Code error' : executionStatus(step)}</b></summary>
+      <div className="tool-section-label">{step.name === 'publish_file' ? 'File' : 'Code / command'}</div>
       <pre>{Object.values(step.arguments || {}).join('\n')}</pre>
-      {step.result && <pre className="tool-result">{readableResult(step.result)}</pre>}
+      {step.result && <><div className="tool-section-label">Result</div><pre className="tool-result">{readableResult(step.result)}</pre></>}
     </details>)}
   </section>;
 }

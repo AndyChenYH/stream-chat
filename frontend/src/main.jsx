@@ -4,6 +4,7 @@ import {readEvents} from './sse';
 import './style.css';
 import './tools.css';
 import Diagnostics from './RequestDiagnostics.jsx';
+import MessageContent from './MessageContent.jsx';
 import {createTrace, recordTrace} from './diagnostics';
 import {Artifact, ToolActivity, mergeToolStep} from './ToolActivity.jsx';
 
@@ -81,7 +82,7 @@ function App() {
           observe(event, data);
           if (event === 'queued') setPhase(data.position ? `Queued · ${data.position} ahead` : 'Preparing');
           if (event === 'starting') setPhase('Starting model…');
-          if (event === 'started') setPhase('Generating');
+          if (event === 'started' || (event === 'status' && data.stage === 'agent_round')) setPhase('Working');
           if (event === 'tool') setToolSteps(old=>mergeToolStep(old,data));
           if (event === 'artifact') setFiles(old=>old.some(f=>f.id===data.id) ? old : [...old,data]);
           if (event === 'replace') setMessages(old=>old.map(m=>m.id===assistantId ? {...m,content:data.text} : m));
@@ -180,6 +181,10 @@ function App() {
   useEffect(() => { bottom.current?.scrollIntoView({behavior:'smooth'}); }, [messages.length, phase]);
   useEffect(() => () => abort.current?.abort(), []);
 
+  const replies = new Set(messages.filter(m => m.role === 'assistant').map(m => m.run_id));
+  const progressLabel = trace?.stage === 'model_retry' && trace.retryAt
+    ? 'Rate limited · automatic retry pending' : trace?.title;
+
   if (!key) return <div className="lock-page"><div className="brand"><span className="mark">s</span> stream</div>
     <form className="unlock" onSubmit={unlock}><div className="eyebrow">YOUR PERSONAL WORKSPACE</div><h1>A little room<br/>to think out loud.</h1>
       <p>Pick up a conversation. Follow an idea.<br/>Your chat, on your own model.</p>
@@ -195,24 +200,35 @@ function App() {
     <nav aria-label="Conversations">{chats.map(c=><button key={c.id} className={chat?.id===c.id?'chat-link selected':'chat-link'} onClick={()=>openChat(c)} disabled={busy || loading}><span>◷</span><span>{c.title}</span></button>)}
       {!chats.length && <p className="empty-list">Your conversations will appear here.</p>}{moreChats && <button onClick={()=>refresh(key,chats.length).catch(e=>setError(e.message))}>Load more</button>}</nav>
     <div className="account"><div className="avatar">A</div><div><strong>Personal workspace</strong><small>Access key protected</small></div><button title="Lock workspace" aria-label="Lock workspace" disabled={busy} onClick={()=>{setKey('');newChat();setChats([])}}>↗</button></div>
-  </aside><main><header><button className="menu-toggle" aria-label="Toggle conversations" aria-expanded={menuOpen} onClick={()=>setMenuOpen(!menuOpen)}>☰</button><div><strong>{chat?.title || 'New conversation'}</strong><span>Private workspace</span></div><div className="status"><i className={model?.ready?'online':''}/>{model?.mode==='on-demand'?'Starts on demand':model?.ready?'Model ready':'Model unavailable'}</div></header>
+  </aside><main><header><button className="menu-toggle" aria-label="Toggle conversations" aria-expanded={menuOpen} onClick={()=>setMenuOpen(!menuOpen)}>☰</button><div><strong>{chat?.title || 'New conversation'}</strong><span>Private workspace</span></div><div className="status"><i className={model?.ready?'online':''}/>{model?.ready?'Qwen · Vercel Gateway':'Model unavailable'}</div></header>
     <section className="conversation" aria-label="Messages">
       {moreMessages && <button disabled={loading} onClick={()=>openChat(chat,true)}>Load earlier messages</button>}
       {!messages.length && <div className="welcome"><span className="spark">✳</span><div className="eyebrow">SPACE FOR YOUR NEXT IDEA</div><h1>What’s on your mind?</h1><p>Ask a question, work through a problem,<br/>or start somewhere unexpected.</p>
         <div className="suggestions">{['Explain a tricky concept','Help me think through an idea','Give me a writing prompt'].map(t=><button key={t} onClick={()=>setPrompt(t)}>{t}<span>↗</span></button>)}</div></div>}
-      {messages.map(m=><article key={m.id} className={`message ${m.role}`}><div className="message-label">{m.role==='user'?'YOU':'STREAM'}{m.incomplete || (m.run_status && m.run_status!=='done') ? <span> · {m.run_status || 'incomplete'}</span> : null}</div><div className="message-text">{m.content || (m.pending?(trace?.title || 'Waiting for server status…'):'')}{m.pending && m.content && <span className="cursor"/>}</div>
-        {m.role==='user' && <ToolActivity steps={toolSteps.filter(s=>s.run_id===m.run_id)}/>}
-        {m.role==='user' && files.filter(f=>f.run_id===m.run_id).map(f=><Artifact key={f.id} file={f} api={api}/>)}</article>)}{trace && <Diagnostics trace={trace}/>}<div ref={bottom}/>
+      {messages.map(m=><article key={m.id} className={`message ${m.role}`}>
+        <div className="message-label">{m.role==='user'?'YOU':'STREAM'}{m.incomplete || (m.run_status && m.run_status!=='done') ? <span> · {m.run_status || 'incomplete'}</span> : null}</div>
+        {m.role==='assistant' && trace?.requestId===m.run_id && <Diagnostics trace={trace}/>}
+        {m.role==='assistant' && <ToolActivity steps={toolSteps.filter(s=>s.run_id===m.run_id)}/>}
+        <div className="message-text">{m.content ? (m.role==='assistant' ? <MessageContent text={m.content}/> : m.content) : (m.pending?(progressLabel || 'Waiting for server status…'):'')}{m.pending && m.content && <span className="cursor"/>}</div>
+        {(m.role==='assistant' || !replies.has(m.run_id)) && <>
+          {m.role==='user' && <ToolActivity steps={toolSteps.filter(s=>s.run_id===m.run_id)}/>}
+          {files.filter(f=>f.run_id===m.run_id).map(f=><Artifact key={f.id} file={f} api={api}/>)}
+        </>}
+      </article>)}{trace && !messages.some(m=>m.role==='assistant' && m.run_id===trace.requestId) && <Diagnostics trace={trace}/>}<div ref={bottom}/>
+
     </section><div className="composer-area">{error && <div className="error" role="alert">{error}{chat && !busy && <button onClick={()=>openChat(chat)}>Reload history</button>}</div>}
       <div className="tool-controls"><label><input type="checkbox" checked={toolsEnabled && !!model?.tools_configured} disabled={busy || loading || !model?.tools_configured} onChange={e=>setToolsEnabled(e.target.checked)}/> Code tools</label>
         <label className="upload-button">＋ Add file<input type="file" aria-label="Add data file" disabled={busy || loading || !model?.tools_configured} onChange={upload}/></label>
-        <small>{model?.tools_configured?'Starts only when called · stops after this task':'Code tools unavailable'}</small>
-        {model?.durable_execution && <small title="Execution belongs to the server. Reload this conversation on another device to follow the same run.">Temporal · {model.temporal_connected?'durable execution':'waiting for connection'} · closing this tab keeps the agent running</small>}
-        {model?.sandbox_budget && <small title="Reserved sandbox time is counted conservatively, including uncertain cleanup. Limits persist across devices and backend restarts.">Sandbox use: {Math.ceil(model.sandbox_budget.daily_seconds/60)}/60 min today · {Math.ceil(model.sandbox_budget.total_seconds/60)}/600 min total</small>}
+        <details className="runtime-details"><summary>Temporal · {model?.temporal_connected?'connected':'connecting'}</summary>
+          <div><p>The agent continues on the server if this tab closes. Reopen the conversation to reconnect.</p>
+          <p>{model?.tools_configured?'Tools run in an isolated sandbox, started only when needed.':'Code tools unavailable.'}</p>
+          <p>Fast mode: brief action summaries and real tool results; private reasoning is not displayed.</p>
+          {model?.sandbox_budget && <p>Sandbox use: {Math.ceil(model.sandbox_budget.daily_seconds/60)}/60 min today · {Math.ceil(model.sandbox_budget.total_seconds/60)}/600 min total</p>}</div>
+        </details>
       </div>
       {files.some(f=>!f.run_id) && <details className="input-files"><summary>Conversation files · {files.filter(f=>!f.run_id).length}</summary>{files.filter(f=>!f.run_id).map(f=><Artifact key={f.id} file={f} api={api}/>)}<small>Files are sent to E2B only when a tool runs. 2 MB per file.</small></details>}
       <form className="composer" onSubmit={send}><textarea aria-label="Message" placeholder="Message Stream…" maxLength={4096} value={prompt} disabled={busy || loading} onChange={e=>setPrompt(e.target.value)} onKeyDown={e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.nativeEvent.isComposing){e.preventDefault();send(e)}}}/>
-        <div className="composer-bottom"><span>{busy?(trace?.title || phase):loading?'Loading…':phase || 'Shift + Enter for a new line'}</span>{busy?<button type="button" className="send" onClick={stopRun} aria-label="Stop generation">■</button>:<button className="send" disabled={!prompt.trim()||loading} aria-label="Send message">↑</button>}</div></form><p className="disclaimer">Answers can be imperfect. Check the details that matter.</p>
+        <div className="composer-bottom"><span>{busy?(progressLabel || phase):loading?'Loading…':phase || 'Shift + Enter for a new line'}</span>{busy?<button type="button" className="send" onClick={stopRun} aria-label="Stop generation">■</button>:<button className="send" disabled={!prompt.trim()||loading} aria-label="Send message">↑</button>}</div></form><p className="disclaimer">Answers can be imperfect. Check the details that matter.</p>
     </div></main></div>;
 }
 createRoot(document.getElementById('root')).render(<App/>);
